@@ -8,8 +8,6 @@ import com.facebook.react.bridge.ReactContextBaseJavaModule
 import com.facebook.react.bridge.ReactMethod
 import com.facebook.react.bridge.ReadableMap
 import com.facebook.react.modules.core.DeviceEventManagerModule
-import org.json.JSONObject
-import tech.zseven.rish.RishUnavailable
 import tech.zseven.rish.runtime.AndroidAgentProviderRoundService
 import tech.zseven.rish.runtime.AndroidAgentQueryService
 import tech.zseven.rish.runtime.AndroidAgentRecoveryService
@@ -102,7 +100,7 @@ class AgentRuntimeModule(reactContext: ReactApplicationContext) :
     @ReactMethod
     fun prepare_agent_attempt(request: ReadableMap?, promise: Promise) {
         val captured = try {
-            JSONObject(requireNotNull(request).toHashMap())
+            RuntimeJson.fromBridgeMap(requireNotNull(request).toHashMap())
         } catch (failure: Exception) {
             Log.w(TAG, "Agent attempt request is invalid", failure)
             promise.reject("E_AGENT_BAD_ARGUMENTS", "Agent attempt request is invalid")
@@ -127,7 +125,7 @@ class AgentRuntimeModule(reactContext: ReactApplicationContext) :
     @ReactMethod
     fun complete_agent_round_v2(request: ReadableMap?, promise: Promise) {
         val captured = try {
-            JSONObject(requireNotNull(request).toHashMap())
+            RuntimeJson.fromBridgeMap(requireNotNull(request).toHashMap())
         } catch (failure: Exception) {
             Log.w(TAG, "Agent round request is invalid", failure)
             promise.reject("E_AGENT_BAD_ARGUMENTS", "Agent round request is invalid")
@@ -150,7 +148,7 @@ class AgentRuntimeModule(reactContext: ReactApplicationContext) :
     @ReactMethod
     fun prepare_agent_tool_batch(request: ReadableMap?, promise: Promise) {
         val captured = try {
-            JSONObject(requireNotNull(request).toHashMap())
+            RuntimeJson.fromBridgeMap(requireNotNull(request).toHashMap())
         } catch (failure: Exception) {
             Log.w(TAG, "Agent tool batch request is invalid", failure)
             promise.reject("E_AGENT_BAD_ARGUMENTS", "Agent tool batch request is invalid")
@@ -173,7 +171,7 @@ class AgentRuntimeModule(reactContext: ReactApplicationContext) :
     @ReactMethod
     fun bind_agent_approval(request: ReadableMap?, promise: Promise) {
         val captured = try {
-            JSONObject(requireNotNull(request).toHashMap())
+            RuntimeJson.fromBridgeMap(requireNotNull(request).toHashMap())
         } catch (failure: Exception) {
             Log.w(TAG, "Agent approval request is invalid", failure)
             promise.reject("E_AGENT_BAD_ARGUMENTS", "Agent approval request is invalid")
@@ -196,7 +194,7 @@ class AgentRuntimeModule(reactContext: ReactApplicationContext) :
     @ReactMethod
     fun execute_agent_tool(request: ReadableMap?, promise: Promise) {
         val captured = try {
-            JSONObject(requireNotNull(request).toHashMap())
+            RuntimeJson.fromBridgeMap(requireNotNull(request).toHashMap())
         } catch (failure: Exception) {
             Log.w(TAG, "Agent tool request is invalid", failure)
             promise.reject("E_AGENT_BAD_ARGUMENTS", "Agent tool request is invalid")
@@ -231,7 +229,7 @@ class AgentRuntimeModule(reactContext: ReactApplicationContext) :
     @ReactMethod
     fun interrupt_agent_attempt(request: ReadableMap?, promise: Promise) {
         val captured = try {
-            JSONObject(requireNotNull(request).toHashMap())
+            RuntimeJson.fromBridgeMap(requireNotNull(request).toHashMap())
         } catch (failure: Exception) {
             Log.w(TAG, "Agent interruption request is invalid", failure)
             promise.reject("E_AGENT_BAD_ARGUMENTS", "Agent interruption request is invalid")
@@ -254,7 +252,7 @@ class AgentRuntimeModule(reactContext: ReactApplicationContext) :
     @ReactMethod
     fun cancel_agent_attempt(request: ReadableMap?, promise: Promise) {
         val captured = try {
-            JSONObject(requireNotNull(request).toHashMap())
+            RuntimeJson.fromBridgeMap(requireNotNull(request).toHashMap())
         } catch (failure: Exception) {
             Log.w(TAG, "Agent cancellation request is invalid", failure)
             promise.reject("E_AGENT_BAD_ARGUMENTS", "Agent cancellation request is invalid")
@@ -277,7 +275,7 @@ class AgentRuntimeModule(reactContext: ReactApplicationContext) :
     @ReactMethod
     fun query_agent_attempt(request: ReadableMap?, promise: Promise) {
         val captured = try {
-            JSONObject(requireNotNull(request).toHashMap())
+            RuntimeJson.fromBridgeMap(requireNotNull(request).toHashMap())
         } catch (failure: Exception) {
             Log.w(TAG, "Agent attempt query is invalid", failure)
             promise.reject("E_AGENT_BAD_ARGUMENTS", "Agent attempt query is invalid")
@@ -300,7 +298,7 @@ class AgentRuntimeModule(reactContext: ReactApplicationContext) :
     @ReactMethod
     fun query_agent_tool(request: ReadableMap?, promise: Promise) {
         val captured = try {
-            JSONObject(requireNotNull(request).toHashMap())
+            RuntimeJson.fromBridgeMap(requireNotNull(request).toHashMap())
         } catch (failure: Exception) {
             Log.w(TAG, "Agent tool could not be queried: request is invalid", failure)
             promise.reject("E_AGENT_BAD_ARGUMENTS", "Agent tool could not be queried")
@@ -322,7 +320,7 @@ class AgentRuntimeModule(reactContext: ReactApplicationContext) :
     @ReactMethod
     fun recover_agent_attempt(request: ReadableMap?, promise: Promise) {
         val captured = try {
-            JSONObject(requireNotNull(request).toHashMap())
+            RuntimeJson.fromBridgeMap(requireNotNull(request).toHashMap())
         } catch (failure: Exception) {
             Log.w(TAG, "Agent recovery request is invalid", failure)
             promise.reject("E_AGENT_BAD_ARGUMENTS", "Agent recovery request is invalid")
@@ -345,7 +343,7 @@ class AgentRuntimeModule(reactContext: ReactApplicationContext) :
     @ReactMethod
     fun finalize_agent_attempt(request: ReadableMap?, promise: Promise) {
         val captured = try {
-            JSONObject(requireNotNull(request).toHashMap())
+            RuntimeJson.fromBridgeMap(requireNotNull(request).toHashMap())
         } catch (failure: Exception) {
             Log.w(TAG, "Agent attempt could not be finalized", failure)
             promise.reject("E_AGENT_BAD_ARGUMENTS", "Agent attempt could not be finalized")
@@ -368,7 +366,7 @@ class AgentRuntimeModule(reactContext: ReactApplicationContext) :
     @ReactMethod
     fun discard_agent_attempt(request: ReadableMap?, promise: Promise) {
         val captured = try {
-            JSONObject(requireNotNull(request).toHashMap())
+            RuntimeJson.fromBridgeMap(requireNotNull(request).toHashMap())
         } catch (failure: Exception) {
             Log.w(TAG, "Agent attempt could not be discarded", failure)
             promise.reject("E_AGENT_BAD_ARGUMENTS", "Agent attempt could not be discarded")
@@ -391,7 +389,7 @@ class AgentRuntimeModule(reactContext: ReactApplicationContext) :
     @ReactMethod
     fun query_agent_cleanup(request: ReadableMap?, promise: Promise) {
         val captured = try {
-            JSONObject(requireNotNull(request).toHashMap())
+            RuntimeJson.fromBridgeMap(requireNotNull(request).toHashMap())
         } catch (failure: Exception) {
             Log.w(TAG, "Agent cleanup could not be queried: request is invalid", failure)
             promise.reject("E_AGENT_BAD_ARGUMENTS", "Agent cleanup could not be queried")

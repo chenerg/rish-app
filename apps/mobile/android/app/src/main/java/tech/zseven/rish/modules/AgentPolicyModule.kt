@@ -30,7 +30,7 @@ class AgentPolicyModule(reactContext: ReactApplicationContext) :
     @ReactMethod
     fun describe(request: ReadableMap?, promise: Promise) {
         val captured = try {
-            JSONObject(requireNotNull(request).toHashMap())
+            RuntimeJson.fromBridgeMap(requireNotNull(request).toHashMap())
         } catch (failure: Exception) {
             Log.w(TAG, "Agent policy request is invalid", failure)
             promise.reject("E_AGENT_BAD_ARGUMENTS", "Agent policy request is invalid")
