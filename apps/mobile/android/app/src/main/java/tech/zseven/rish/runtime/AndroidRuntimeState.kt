@@ -14,9 +14,12 @@ internal class AndroidRuntimeState private constructor(val app: Application) {
     /// The agent WAL lives beside the session database, outside backup, in the
     /// same bytes iOS writes. One root, because Android resolves none.
     val agentWal = AndroidAgentWal(java.io.File(app.noBackupFilesDir, "agent"))
-    /// App-private workspace roots. Android resolves only these: no
-    /// security-scoped folders, no legacy projects, no rebinding yet.
-    val workspaces = AndroidWorkspaceRegistry(java.io.File(app.filesDir, "workspaces"))
+    /// SAF mechanics: the persisted grants and provider queries a granted
+    /// workspace root lives on.
+    val safAccess = AndroidSafAccess(app.contentResolver)
+    /// Workspace roots: app-private directories and granted SAF trees. No
+    /// legacy projects, no rebinding yet.
+    val workspaces = AndroidWorkspaceRegistry(java.io.File(app.filesDir, "workspaces"), safAccess)
     val roots = AndroidAgentRootResolver(workspaces)
     val preparedAttempts = AndroidPreparedAttemptStore(sessions, agentWal, roots)
     /// Which native tasks this process still owns; a persisted owner from a
@@ -24,7 +27,7 @@ internal class AndroidRuntimeState private constructor(val app: Application) {
     val liveTasks = AndroidLiveTasks()
     val agentOperations = AndroidAgentOperations(agentWal)
     val executionLedger = AndroidAgentExecutionLedger(agentWal, liveTasks, agentOperations)
-    val workspaceTools = AndroidWorkspaceToolExecutor(workspaces, roots)
+    val workspaceTools = AndroidWorkspaceToolExecutor(workspaces, roots, safAccess)
     /// The registry-v3 runtime tools, as far as this platform serves them:
     /// the listing runs, the four mutations refuse per call at preparation.
     val runtimeTools = AndroidRuntimeToolExecutor(roots)

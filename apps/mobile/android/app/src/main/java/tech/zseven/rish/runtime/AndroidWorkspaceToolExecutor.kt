@@ -32,6 +32,8 @@ import java.io.IOException
 internal class AndroidWorkspaceToolExecutor(
     private val workspaces: AndroidWorkspaceRegistry,
     private val roots: AndroidAgentRootResolver,
+    /** SAF mechanics for granted roots; null on hosts that never grant one. */
+    private val saf: AndroidSafAccess? = null,
 ) {
 
     /** A refusal carrying the agent's vocabulary rather than a message. */
@@ -39,6 +41,16 @@ internal class AndroidWorkspaceToolExecutor(
 
     /** The three tools a workspace root carries. */
     val tools: List<String> = listOf("read_file", "write_file", "list_dir")
+
+    /**
+     * The two kinds of root a binding can resolve to on this platform: a
+     * directory this app owns, or a granted SAF tree. Which one a workspace
+     * is stays the registry's answer; the tools only differ in mechanism.
+     */
+    private sealed interface RootHandle {
+        class Owned(val directory: File) : RootHandle
+        class Granted(val tree: android.net.Uri) : RootHandle
+    }
 
     private fun rule(request: JSONObject): JSONObject =
         RishAgentCoreNative.workspaceTool(request) ?: throw Refused(INVALID)
@@ -85,15 +97,20 @@ internal class AndroidWorkspaceToolExecutor(
     }
 
     /** `dev:ino:size:mtime_sec:mtime_nsec`, spelled by the core. */
-    private fun revision(file: File): String {
-        // Android exposes no st_dev or st_ino through java.io, and the rule
-        // only requires the five numbers to identify a file state, so the
-        // fields this platform cannot read are reported as zero rather than
-        // invented. A file that changed still changes size or mtime.
+    private fun revision(file: File): String = revisionOf(file.length(), file.lastModified())
+
+    /**
+     * The revision one observation implies. Android exposes no st_dev or
+     * st_ino -- through java.io or through SAF -- and the rule only requires
+     * the five numbers to identify a file state, so the fields this platform
+     * cannot read are reported as zero rather than invented. A file that
+     * changed still changes size or mtime.
+     */
+    private fun revisionOf(size: Long, mtimeMs: Long): String {
         val reply = rule(
             JSONObject().put("op", "revision").put("dev", 0).put("ino", 0)
-                .put("size", file.length()).put("mtime_sec", file.lastModified() / 1000)
-                .put("mtime_nsec", (file.lastModified() % 1000) * 1_000_000),
+                .put("size", size).put("mtime_sec", mtimeMs / 1000)
+                .put("mtime_nsec", (mtimeMs % 1000) * 1_000_000),
         )
         return reply.optString("revision").ifEmpty { throw Refused(INVALID) }
     }
@@ -107,31 +124,17 @@ internal class AndroidWorkspaceToolExecutor(
      */
     fun execute(name: String, arguments: JSONObject, root: JSONObject): JSONObject {
         if (name !in tools) throw Refused(INVALID)
-        val workspaceId = root.optString("workspace_id").takeIf { it.isNotEmpty() }
-        // The projection carries the authority -- which grants this root has,
-        // and the fingerprint the registry sealed it under. It deliberately
-        // carries no path: where the directory is stays with the registry, and
-        // a path is not something JavaScript's root reference should imply.
-        val resolved = roots.resolveAgentProjection(root) ?: throw Refused(CONFLICT)
-        val directory = workspaces.rootFor(workspaceId ?: throw Refused(CONFLICT))
-            ?: throw Refused(CONFLICT)
-        if (!directory.isDirectory) throw Refused(CONFLICT)
-
-        // A capability the binding does not carry is a conflict, not an
-        // invalid argument: the tool is real and the root simply may not. The
-        // names are the projection's -- `file_read` and `file_write`, what a
-        // tool may do -- not the registry's `read`/`write` grants, which are
-        // about the binding. Checking the wrong list accepted every tool.
-        val capabilities = resolved.optJSONArray("capabilities") ?: JSONArray()
-        val needed = if (name == "write_file") "file_write" else "file_read"
-        if ((0 until capabilities.length()).none { capabilities.optString(it) == needed }) {
-            throw Refused(CONFLICT)
-        }
-
-        return when (name) {
-            "read_file" -> readFile(directory, arguments)
-            "write_file" -> writeFile(directory, arguments)
-            else -> listDir(directory, arguments)
+        return when (val handle = rootHandle(name, root)) {
+            is RootHandle.Owned -> when (name) {
+                "read_file" -> readFile(handle.directory, arguments)
+                "write_file" -> writeFile(handle.directory, arguments)
+                else -> listDir(handle.directory, arguments)
+            }
+            is RootHandle.Granted -> when (name) {
+                "read_file" -> safReadFile(handle.tree, arguments)
+                "write_file" -> safWriteFile(handle.tree, arguments)
+                else -> safListDir(handle.tree, arguments)
+            }
         }
     }
 
@@ -148,11 +151,18 @@ internal class AndroidWorkspaceToolExecutor(
      */
     fun prepare(name: String, arguments: JSONObject, root: JSONObject): JSONObject {
         if (name !in tools) throw Refused(INVALID)
-        val directory = rootDirectory(name, root)
-        val prepared = when (name) {
-            "list_dir" -> prepareList(directory, arguments)
-            "read_file" -> prepareRead(directory, arguments)
-            else -> prepareWrite(directory, arguments)
+        val handle = rootHandle(name, root)
+        val prepared = when (handle) {
+            is RootHandle.Owned -> when (name) {
+                "list_dir" -> prepareList(handle.directory, arguments)
+                "read_file" -> prepareRead(handle.directory, arguments)
+                else -> prepareWrite(handle.directory, arguments)
+            }
+            is RootHandle.Granted -> when (name) {
+                "list_dir" -> safPrepareList(handle.tree, arguments)
+                "read_file" -> safPrepareRead(handle.tree, arguments)
+                else -> safPrepareWrite(handle.tree, arguments)
+            }
         }
         // What the call reserves is part of the prepared shape, not an extra:
         // the ledger holds a write's reservation to its precondition's
@@ -268,19 +278,37 @@ internal class AndroidWorkspaceToolExecutor(
         .put("content_bytes", JSONObject.NULL).put("prior", JSONObject.NULL)
         .put("diff_preview", JSONObject.NULL).put("diff_truncated", false)
 
-    /** The directory a root names, with the capability the tool needs. */
-    private fun rootDirectory(name: String, root: JSONObject): File {
+    /**
+     * The root a binding resolves to, with the capability the tool needs.
+     *
+     * The projection carries the authority -- which grants this root has, and
+     * the fingerprint the registry sealed it under. It deliberately carries no
+     * path: where the root is stays with the registry, and an owned directory
+     * or a granted tree URI is the registry's answer, never JavaScript's. A
+     * capability the binding does not carry is a conflict, not an invalid
+     * argument: the tool is real and the root simply may not. The names are
+     * the projection's -- `file_read` and `file_write`, what a tool may do --
+     * not the registry's `read`/`write` grants, which are about the binding.
+     */
+    private fun rootHandle(name: String, root: JSONObject): RootHandle {
         val workspaceId = root.optString("workspace_id").takeIf { it.isNotEmpty() }
-        val resolved = roots.resolveAgentProjection(root) ?: throw Refused(CONFLICT)
-        val directory = workspaces.rootFor(workspaceId ?: throw Refused(CONFLICT))
             ?: throw Refused(CONFLICT)
-        if (!directory.isDirectory) throw Refused(CONFLICT)
+        val resolved = roots.resolveAgentProjection(root) ?: throw Refused(CONFLICT)
         val capabilities = resolved.optJSONArray("capabilities") ?: JSONArray()
         val needed = if (name == "write_file") "file_write" else "file_read"
         if ((0 until capabilities.length()).none { capabilities.optString(it) == needed }) {
             throw Refused(CONFLICT)
         }
-        return directory
+        val directory = workspaces.rootFor(workspaceId)
+        if (directory != null) {
+            if (!directory.isDirectory) throw Refused(CONFLICT)
+            return RootHandle.Owned(directory)
+        }
+        // Not an owned root. A granted folder resolves through its tree URI
+        // -- never through a File path it does not have.
+        if (saf == null) throw Refused(CONFLICT)
+        val tree = workspaces.grantedTreeFor(workspaceId) ?: throw Refused(CONFLICT)
+        return RootHandle.Granted(tree)
     }
 
     private fun path(arguments: JSONObject, key: String = "path"): String {
@@ -313,7 +341,11 @@ internal class AndroidWorkspaceToolExecutor(
             val fresh = prepare(name, arguments, root).optJSONObject("precondition")
             return status(if (sameJson(fresh, precondition)) "not_dispatched" else "ambiguous")
         }
-        val directory = rootDirectory(name, root)
+        val handle = rootHandle(name, root)
+        if (handle is RootHandle.Granted) {
+            return safRecoverWrite(handle.tree, arguments, precondition)
+        }
+        val directory = (handle as RootHandle.Owned).directory
         val content = arguments.opt("content") as? String ?: throw Refused(INVALID)
         val requested = path(arguments)
         val file = resolve(directory, components(requested, allowRoot = false))
@@ -412,6 +444,24 @@ internal class AndroidWorkspaceToolExecutor(
         return rule(JSONObject().put("op", "directory_listing").put("entries", entries))
     }
 
+    /**
+     * The same core reading over one SAF observation: one `children` query is
+     * the whole walk, and the fingerprint and the entries both come from it.
+     */
+    private fun safListing(tree: android.net.Uri, directory: AndroidSafAccess.Node): JSONObject {
+        val children = safAccess().children(tree, directory.documentId)
+            ?: throw Refused(PERSISTENCE)
+        val entries = JSONArray()
+        for (child in children.sortedBy { it.name }) {
+            entries.put(
+                JSONObject().put("name", child.name)
+                    .put("kind", if (child.isDirectory) "directory" else "file")
+                    .put("revision", revisionOf(child.size, child.lastModified)),
+            )
+        }
+        return rule(JSONObject().put("op", "directory_listing").put("entries", entries))
+    }
+
     private fun readFile(root: File, arguments: JSONObject): JSONObject {
         if (arguments.keys().asSequence().toSet() != setOf("path")) throw Refused(INVALID)
         val file = resolve(root, components(path(arguments), allowRoot = false))
@@ -502,11 +552,18 @@ internal class AndroidWorkspaceToolExecutor(
         val requested = if (keys.isEmpty()) "" else path(arguments)
         val directory = resolve(root, components(requested, allowRoot = true))
         if (!directory.isDirectory) throw Refused(NOT_FOUND)
-        val listed = listing(directory)
+        return listEffect(listing(directory))
+    }
+
+    /**
+     * The listing effect over one observation. A listing that will not fit
+     * the feedback cap drops its last entries and says so, rather than
+     * failing the call: the model is better served by a truncated listing
+     * than by nothing. The core decides what fits, and the disk (or the
+     * provider) is never asked again while it decides.
+     */
+    private fun listEffect(listed: JSONObject): JSONObject {
         val entries = listed.optJSONArray("entries") ?: throw Refused(PERSISTENCE)
-        // A listing that will not fit the feedback cap drops its last entries
-        // and says so, rather than failing the call: the model is better served
-        // by a truncated listing than by nothing. The core decides what fits.
         var visible = entries
         var truncated = false
         while (true) {
@@ -531,6 +588,229 @@ internal class AndroidWorkspaceToolExecutor(
             visible = shorter
             truncated = true
         }
+    }
+
+    // --- granted roots, over the Storage Access Framework -------------------
+    //
+    // The same tools, the same core rules, a different mechanism. A granted
+    // root is a tree URI: paths resolve through provider queries instead of
+    // the filesystem, a listing is one `queryChildDocuments` pass, and a write
+    // goes through the provider with no rename-into-place. Every shape built
+    // here -- preconditions, previews, feedback, settled facts -- comes from
+    // the same helpers the owned path uses, so the two cannot drift.
+
+    private fun safAccess(): AndroidSafAccess = saf ?: throw Refused(CONFLICT)
+
+    private fun safPrepareList(tree: android.net.Uri, arguments: JSONObject): JSONObject {
+        val keys = arguments.keys().asSequence().toSet()
+        if (keys.isNotEmpty() && keys != setOf("path")) throw Refused(INVALID)
+        val requested = if (keys.isEmpty()) "" else path(arguments)
+        val parts = components(requested, allowRoot = true)
+        val directory = safAccess().resolve(tree, parts) ?: throw Refused(NOT_FOUND)
+        if (!directory.isDirectory) throw Refused(NOT_FOUND)
+        // One observation: the fingerprint the precondition asserts comes
+        // from the same single pass the entries would.
+        val fingerprint = safListing(tree, directory)
+            .optString("directory_fingerprint_sha256")
+            .takeIf { it.isNotEmpty() } ?: throw Refused(PERSISTENCE)
+        return JSONObject()
+            .put(
+                "precondition",
+                JSONObject().put("schema_version", 1).put("kind", "list_dir")
+                    .put("directory_fingerprint_sha256", fingerprint),
+            )
+            .put(
+                "approval_preview",
+                preview("list_dir", if (parts.isEmpty()) JSONArray() else JSONArray().put(requested)),
+            )
+    }
+
+    private fun safPrepareRead(tree: android.net.Uri, arguments: JSONObject): JSONObject {
+        if (arguments.keys().asSequence().toSet() != setOf("path")) throw Refused(INVALID)
+        val requested = path(arguments)
+        val node = safAccess().resolve(tree, components(requested, allowRoot = false))
+            ?: throw Refused(NOT_FOUND)
+        if (node.isDirectory) throw Refused(NOT_FOUND)
+        return JSONObject()
+            .put(
+                "precondition",
+                JSONObject().put("schema_version", 1).put("kind", "read_file")
+                    .put("source_revision", revisionOf(node.size, node.lastModified)),
+            )
+            .put("approval_preview", preview("read_file", JSONArray().put(requested)))
+    }
+
+    private fun safPrepareWrite(tree: android.net.Uri, arguments: JSONObject): JSONObject {
+        val content = arguments.opt("content")
+        if (content !is String) throw Refused(INVALID)
+        val requested = path(arguments)
+        val parts = components(requested, allowRoot = false)
+        val target = safAccess().resolve(tree, parts)
+        val expected = rule(
+            JSONObject().put("op", "write_expected_prior").put("arguments", arguments),
+        ).optJSONObject("expected_prior") ?: throw Refused(INVALID)
+        if (target != null && target.isDirectory) throw Refused(CONFLICT)
+        val actual = if (target != null) {
+            JSONObject().put("schema_version", 1).put("kind", "known")
+                .put("revision", revisionOf(target.size, target.lastModified))
+        } else {
+            JSONObject().put("schema_version", 1).put("kind", "absent")
+        }
+        val same = RishAgentCoreNative.canonical(expected.toString())
+            ?.let { it == RishAgentCoreNative.canonical(actual.toString()) } ?: false
+        if (!same) throw Refused(CONFLICT)
+        val priorPreview = JSONObject().put("schema_version", 1)
+            .put("kind", actual.optString("kind"))
+            .put("bytes", if (target != null) target.size.toInt() else JSONObject.NULL)
+        val bytes = content.toByteArray(Charsets.UTF_8)
+        val pathDigest = RishAgentCoreNative.hashBytes(
+            "relative-path", requested.toByteArray(Charsets.UTF_8),
+        ) ?: throw Refused(PERSISTENCE)
+        val contentDigest = RishAgentCoreNative.hashBytes("file-content", bytes)
+            ?: throw Refused(PERSISTENCE)
+        return JSONObject()
+            .put(
+                "precondition",
+                JSONObject().put("schema_version", 2).put("kind", "write_file")
+                    .put("relative_path_sha256", pathDigest).put("prior", actual)
+                    .put("content_sha256", contentDigest).put("content_bytes", bytes.size),
+            )
+            .put(
+                "approval_preview",
+                JSONObject().put("schema_version", 1).put("kind", "write_file")
+                    .put("paths", JSONArray().put(requested))
+                    .put("content_bytes", bytes.size)
+                    .put("prior", priorPreview)
+                    .put("diff_preview", JSONObject.NULL)
+                    .put("diff_truncated", false),
+            )
+    }
+
+    private fun safReadFile(tree: android.net.Uri, arguments: JSONObject): JSONObject {
+        if (arguments.keys().asSequence().toSet() != setOf("path")) throw Refused(INVALID)
+        val node = safAccess().resolve(tree, components(path(arguments), allowRoot = false))
+            ?: throw Refused(NOT_FOUND)
+        if (node.isDirectory) throw Refused(NOT_FOUND)
+        val cap = bounds().getInt("max_read_bytes")
+        // One byte past the cap, so a file exactly at the cap is not reported
+        // as truncated and one over it is.
+        val bytes = safAccess().read(tree, node.documentId, cap + 1)
+            ?: throw Refused(PERSISTENCE)
+        val truncated = bytes.size > cap
+        val kept = if (truncated) bytes.copyOf(cap) else bytes
+        val payload = JSONObject().put("schema_version", 1)
+            .put("content", String(kept, Charsets.UTF_8))
+            .put("revision", revisionOf(node.size, node.lastModified))
+            .put("truncated", truncated)
+        if (!truncated) payload.put("sha256", sha256(kept))
+        val feedback = feedbackOrNull("read_file", payload) ?: throw Refused(PERSISTENCE)
+        return effect(
+            feedback,
+            JSONObject().put("schema_version", 1).put("kind", "read_file")
+                .put("source_revision", revisionOf(node.size, node.lastModified)),
+            truncated,
+            mayHaveOccurred = false,
+        )
+    }
+
+    private fun safWriteFile(tree: android.net.Uri, arguments: JSONObject): JSONObject {
+        if (arguments.keys().asSequence().toSet() != setOf("path", "content")) throw Refused(INVALID)
+        val content = arguments.opt("content")
+        if (content !is String) throw Refused(INVALID)
+        val parts = components(path(arguments), allowRoot = false)
+        val access = safAccess()
+        var parent = access.treeRoot(tree) ?: throw Refused(PERSISTENCE)
+        // Intermediate directories are created as the provider allows, the
+        // same way the owned path's mkdirs() creates them.
+        for (component in parts.dropLast(1)) {
+            if (!parent.isDirectory) throw Refused(CONFLICT)
+            val children = access.children(tree, parent.documentId) ?: throw Refused(PERSISTENCE)
+            val existing = children.firstOrNull { it.name == component }
+            parent = when {
+                existing == null -> {
+                    val created = access.createDocument(tree, parent.documentId, component, directory = true)
+                        ?: throw Refused(PERSISTENCE)
+                    AndroidSafAccess.Node(created, component, true, 0L, 0L)
+                }
+                existing.isDirectory -> existing
+                else -> throw Refused(CONFLICT)
+            }
+        }
+        if (!parent.isDirectory) throw Refused(CONFLICT)
+        val leaf = parts.last()
+        val siblings = access.children(tree, parent.documentId) ?: throw Refused(PERSISTENCE)
+        val existing = siblings.firstOrNull { it.name == leaf }
+        if (existing != null && existing.isDirectory) throw Refused(CONFLICT)
+        val documentId = existing?.documentId
+            ?: access.createDocument(tree, parent.documentId, leaf, directory = false)
+            ?: throw Refused(PERSISTENCE)
+        val bytes = content.toByteArray(Charsets.UTF_8)
+        // No rename-into-place exists through a provider; the write's
+        // precondition and the ledger's may-have-occurred marker are what
+        // keep a torn write visible instead of silent.
+        if (!access.write(tree, documentId, bytes)) throw Refused(PERSISTENCE)
+        val written = access.nodeFor(tree, documentId) ?: throw Refused(PERSISTENCE)
+        val actual = revisionOf(written.size, written.lastModified)
+        val digest = sha256(bytes)
+        val feedback = feedbackOrNull(
+            "write_file",
+            JSONObject().put("schema_version", 1).put("bytes", bytes.size)
+                .put("revision", actual).put("sha256", digest),
+        ) ?: throw Refused(PERSISTENCE)
+        AndroidDebugLog.log("saf_tool", "write_file_settled", leaf)
+        return effect(
+            feedback,
+            JSONObject().put("schema_version", 1).put("kind", "write_file")
+                .put("actual_revision", actual)
+                .put("content_sha256", RishAgentCoreNative.hashBytes("file-content", bytes)),
+            truncated = false,
+            mayHaveOccurred = true,
+        )
+    }
+
+    private fun safListDir(tree: android.net.Uri, arguments: JSONObject): JSONObject {
+        val keys = arguments.keys().asSequence().toSet()
+        if (keys.isNotEmpty() && keys != setOf("path")) throw Refused(INVALID)
+        val requested = if (keys.isEmpty()) "" else path(arguments)
+        val directory = safAccess().resolve(tree, components(requested, allowRoot = true))
+            ?: throw Refused(NOT_FOUND)
+        if (!directory.isDirectory) throw Refused(NOT_FOUND)
+        // One observation; the truncation loop below asks the core what fits
+        // without ever querying the provider again.
+        return listEffect(safListing(tree, directory))
+    }
+
+    /** [recover] for a write against a granted root; the same three answers. */
+    private fun safRecoverWrite(
+        tree: android.net.Uri,
+        arguments: JSONObject,
+        precondition: JSONObject?,
+    ): JSONObject {
+        val content = arguments.opt("content") as? String ?: throw Refused(INVALID)
+        val node = safAccess().resolve(tree, components(path(arguments), allowRoot = false))
+        val prior = precondition?.optJSONObject("prior")
+        val priorKind = prior?.optString("kind")
+        if (node == null) {
+            return status(if (priorKind == "absent") "not_dispatched" else "ambiguous")
+        }
+        if (node.isDirectory) return status("ambiguous")
+        val before = revisionOf(node.size, node.lastModified)
+        if (priorKind == "known" && prior.optString("revision") == before) {
+            return status("not_dispatched")
+        }
+        val bytes = content.toByteArray(Charsets.UTF_8)
+        if (node.size != bytes.size.toLong()) return status("ambiguous")
+        val actual = safAccess().read(tree, node.documentId, bytes.size + 1)
+            ?: return status("ambiguous")
+        if (actual.size != bytes.size) return status("ambiguous")
+        // Read between two readings of the revision: a file being written
+        // while this looks at it is ambiguous, not settled.
+        val after = safAccess().nodeFor(tree, node.documentId)
+        val stable = after != null && revisionOf(after.size, after.lastModified) == before
+        val digest = RishAgentCoreNative.hashBytes("file-content", actual)
+        val landed = stable && digest != null &&
+            digest == precondition?.optString("content_sha256")
+        return status(if (landed) "settled" else "ambiguous").put("actual_revision", before)
     }
 
     private companion object {
