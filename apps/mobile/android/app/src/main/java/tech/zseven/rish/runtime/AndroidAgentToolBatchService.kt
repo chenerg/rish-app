@@ -32,6 +32,7 @@ internal class AndroidAgentToolBatchService(
     private val workspaceTools: AndroidWorkspaceToolExecutor,
     private val operations: AndroidAgentOperations,
     private val transcripts: AndroidAgentTranscriptStore,
+    private val runtimeTools: AndroidRuntimeToolExecutor,
 ) {
     class Refused(val code: String) : Exception(code)
 
@@ -177,12 +178,19 @@ internal class AndroidAgentToolBatchService(
         }
         if (!call.isNull("rejection")) return JSONObject()
         val name = call.optString("name")
+        val arguments = call.optJSONObject("arguments") ?: JSONObject()
+        if (name in runtimeTools.tools) {
+            // The runtime family answers with its own prepared shape or its
+            // own per-call rejection -- never a store error, which the core
+            // would read as "arguments do not match the schema" and reject
+            // arguments that matched perfectly.
+            return runtimeTools.probe(name, arguments, root)
+        }
         if (name !in workspaceTools.tools) {
             // Not servable here. The core's own invalid-argument mapping turns
             // this into the right rejection for the tool's family.
             return JSONObject().put("error", 1)
         }
-        val arguments = call.optJSONObject("arguments") ?: JSONObject()
         return try {
             JSONObject().put("prepared", workspaceTools.prepare(name, arguments, root))
         } catch (refused: AndroidWorkspaceToolExecutor.Refused) {

@@ -25,16 +25,19 @@ internal class AndroidRuntimeState private constructor(val app: Application) {
     val agentOperations = AndroidAgentOperations(agentWal)
     val executionLedger = AndroidAgentExecutionLedger(agentWal, liveTasks, agentOperations)
     val workspaceTools = AndroidWorkspaceToolExecutor(workspaces, roots)
+    /// The registry-v3 runtime tools, as far as this platform serves them:
+    /// the listing runs, the four mutations refuse per call at preparation.
+    val runtimeTools = AndroidRuntimeToolExecutor(roots)
     val agentPolicy = AndroidAgentPolicyService(roots, AndroidAgentToolRegistry)
     val agentRounds = AndroidAgentRoundJournal(agentWal, liveTasks)
     val agentTranscripts = AndroidAgentTranscriptStore(agentWal)
     val toolBatch = AndroidAgentToolBatchService(
         agentWal, sessions, preparedAttempts, executionLedger, roots, workspaceTools,
-        agentOperations, agentTranscripts,
+        agentOperations, agentTranscripts, runtimeTools,
     )
     val toolExecution = AndroidAgentToolExecutionService(
         agentWal, sessions, preparedAttempts, executionLedger, roots, workspaceTools, liveTasks,
-        agentTranscripts, agentOperations,
+        agentTranscripts, agentOperations, runtimeTools,
     )
     val lifecycle = AndroidAgentLifecycleService(agentWal, sessions, agentOperations, roots)
     val approvals = AndroidAgentApprovalService(

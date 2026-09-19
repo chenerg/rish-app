@@ -29,6 +29,7 @@ internal class AndroidAgentToolExecutionService(
     private val liveTasks: AndroidLiveTasks,
     private val transcripts: AndroidAgentTranscriptStore,
     private val operations: AndroidAgentOperations,
+    private val runtimeTools: AndroidRuntimeToolExecutor,
 ) {
     class Refused(val code: String) : Exception(code)
 
@@ -345,6 +346,16 @@ internal class AndroidAgentToolExecutionService(
      */
     private fun effectOf(request: JSONObject, arguments: JSONObject): JSONObject {
         val name = request.optString("name")
+        if (name in runtimeTools.executable) {
+            return try {
+                runtimeTools.execute(name, arguments, request.optJSONObject("root") ?: JSONObject())
+                    .also { android.util.Log.w("RishAgent", "runtime tool $name ran") }
+            } catch (refused: AndroidRuntimeToolExecutor.Refused) {
+                android.util.Log.w("RishAgent", "runtime tool $name refused: ${refused.code}", refused)
+                decide(JSONObject().put("op", "generic_failure").put("request", request))
+                    .optJSONObject("effect") ?: throw Refused(NATIVE)
+            }
+        }
         if (name !in workspaceTools.tools) {
             return decide(
                 JSONObject().put("op", "generic_failure").put("request", request),

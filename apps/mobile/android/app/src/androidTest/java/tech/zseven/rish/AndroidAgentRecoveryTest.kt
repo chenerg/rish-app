@@ -25,6 +25,7 @@ import tech.zseven.rish.runtime.AndroidLiveTasks
 import tech.zseven.rish.runtime.AndroidModelTransport
 import tech.zseven.rish.runtime.AndroidPreparedAttemptStore
 import tech.zseven.rish.runtime.AndroidProviderConfiguration
+import tech.zseven.rish.runtime.AndroidRuntimeToolExecutor
 import tech.zseven.rish.runtime.AndroidSessionStore
 import tech.zseven.rish.runtime.AndroidWorkspaceRegistry
 import tech.zseven.rish.runtime.AndroidWorkspaceToolExecutor
@@ -84,6 +85,7 @@ class AndroidAgentRecoveryTest {
         val executions = AndroidAgentToolExecutionService(
             wal, sessions, prepared, ledger, roots,
             AndroidWorkspaceToolExecutor(workspaces, roots), liveTasks, transcripts, operations,
+            AndroidRuntimeToolExecutor(roots),
         )
         val queries = AndroidAgentQueryService(wal, sessions, prepared, ledger, transcripts)
         try {
