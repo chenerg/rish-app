@@ -97,6 +97,7 @@ internal class AndroidAgentToolBatchService(
                 "RishAgent",
                 "batch gate refused: ${rejected.optString("failure_code")}",
             )
+            AndroidDebugLog.log("tool_batch", "gate_refused", rejected.optString("failure_code"))
             return rejected
         }
 
@@ -201,6 +202,7 @@ internal class AndroidAgentToolBatchService(
                 "RishAgent",
                 "tool probe refused: $name ${refused.code}",
             )
+            AndroidDebugLog.log("tool_batch", "probe_refused", "$name ${refused.code}")
             JSONObject().put("error", errorFor(refused.code))
         }
     }

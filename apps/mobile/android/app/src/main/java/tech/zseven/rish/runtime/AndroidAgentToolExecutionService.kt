@@ -369,6 +369,7 @@ internal class AndroidAgentToolExecutionService(
             // must still be visible here, or an effect that never happened is
             // indistinguishable from one that did nothing.
             android.util.Log.w("RishAgent", "tool $name refused: ${refused.code}", refused)
+            AndroidDebugLog.log("tool_execution", "refused", "$name ${refused.code}")
             decide(JSONObject().put("op", "generic_failure").put("request", request))
                 .optJSONObject("effect") ?: throw Refused(NATIVE)
         }
