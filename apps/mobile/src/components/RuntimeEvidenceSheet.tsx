@@ -1,8 +1,9 @@
-import React, { useMemo } from 'react';
+import React, { useCallback, useMemo } from 'react';
 import {
   Modal,
   Pressable,
   ScrollView,
+  Share,
   StyleSheet,
   Text,
   View,
@@ -14,6 +15,7 @@ import CircleAlert from 'lucide-react-native/icons/circle-alert';
 import CircleCheck from 'lucide-react-native/icons/circle-check';
 import RefreshCw from 'lucide-react-native/icons/refresh-cw';
 
+import { DebugLog } from '../native/DebugLog';
 import type { RuntimeProof } from '../native/LocalRuntime';
 import { useAppPresentation } from '../presentation/AppPresentation';
 import { fonts, type ThemePalette } from '../theme';
@@ -56,6 +58,16 @@ export function RuntimeEvidenceSheet({
   const insets = useSafeAreaInsets();
   const { colors, t } = useAppPresentation();
   const styles = useMemo(() => createStyles(colors), [colors]);
+  const debugLogAvailable = useMemo(() => DebugLog.isAvailable(), []);
+  const exportDebugLog = useCallback(async () => {
+    try {
+      const text = await DebugLog.export();
+      if (text.length === 0) return;
+      await Share.share({ message: text });
+    } catch {
+      // Sharing is best effort; a cancelled share sheet is not a failure.
+    }
+  }, []);
   const verified = runtimeStatus === 'verified';
   const failed = runtimeStatus === 'failed';
   const StatusIcon = verified ? CircleCheck : failed ? CircleAlert : Activity;
@@ -185,6 +197,22 @@ export function RuntimeEvidenceSheet({
               <Text style={styles.failureText}>{failure}</Text>
             </View>
           )}
+          {debugLogAvailable && (
+            <Pressable
+              accessibilityLabel={t('runtime.exportDebugLog')}
+              accessibilityRole="button"
+              onPress={exportDebugLog}
+              style={({ pressed }) => [
+                styles.exportLog,
+                pressed && styles.pressed,
+              ]}
+              testID="runtime-export-debug-log"
+            >
+              <Text style={styles.exportLogText}>
+                {t('runtime.exportDebugLog')}
+              </Text>
+            </Pressable>
+          )}
         </ScrollView>
         <Pressable
           accessibilityLabel={
@@ -306,5 +334,15 @@ const createStyles = (colors: ThemePalette) =>
       marginTop: 13,
     },
     doneText: { color: colors.background, fontSize: 15, fontWeight: '700' },
+    exportLog: {
+      minHeight: 38,
+      alignItems: 'center',
+      justifyContent: 'center',
+      borderRadius: 14,
+      borderWidth: StyleSheet.hairlineWidth,
+      borderColor: colors.line,
+      marginTop: 14,
+    },
+    exportLogText: { color: colors.muted, fontSize: 12, fontWeight: '600' },
     pressed: { opacity: 0.6, transform: [{ scale: 0.985 }] },
   });

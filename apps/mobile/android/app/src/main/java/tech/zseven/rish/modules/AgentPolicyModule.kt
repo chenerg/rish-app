@@ -7,7 +7,6 @@ import com.facebook.react.bridge.ReactApplicationContext
 import com.facebook.react.bridge.ReactContextBaseJavaModule
 import com.facebook.react.bridge.ReactMethod
 import com.facebook.react.bridge.ReadableMap
-import org.json.JSONObject
 import tech.zseven.rish.runtime.AndroidAgentPolicyService
 import tech.zseven.rish.runtime.AndroidRuntimeState
 import tech.zseven.rish.runtime.RuntimeJson
