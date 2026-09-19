@@ -6157,7 +6157,10 @@ export function HomeScreen({
 
   return (
     <KeyboardAvoidingView
-      behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+      // Android is edge-to-edge on this React Native version, so the window
+      // no longer resizes under the IME and the composer must be padded up
+      // the same way iOS pads it. `undefined` here left the composer covered.
+      behavior="padding"
       style={styles.root}
     >
       <View
