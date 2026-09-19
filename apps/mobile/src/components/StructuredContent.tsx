@@ -15,6 +15,7 @@ import { fonts, type ThemePalette } from '../theme';
 import { AppIcon } from './AppIcon';
 import { SpinningIcon } from './SpinningIcon';
 import { MarkdownText } from './MarkdownText';
+import { toolArgumentsSummary } from './toolActivityProjection';
 
 export type StructuredBlock =
   | { id: string; type: 'text'; text: string; reveal?: boolean }
@@ -417,6 +418,11 @@ function ToolBlock({
           <Text numberOfLines={1} style={styles.toolName}>
             {block.name}
           </Text>
+          {isCall && toolArgumentsSummary(block.arguments).length > 0 && (
+            <Text numberOfLines={1} style={styles.toolSummary} testID="tool-arguments-summary">
+              {toolArgumentsSummary(block.arguments)}
+            </Text>
+          )}
         </View>
         <Text
           accessibilityLabel={announcement}
@@ -530,6 +536,12 @@ const createStyles = (colors: ThemePalette) =>
       fontFamily: fonts.mono,
       fontSize: 11,
       marginTop: 3,
+    },
+    toolSummary: {
+      color: colors.muted,
+      fontFamily: fonts.mono,
+      fontSize: 9,
+      marginTop: 2,
     },
     status: {
       color: colors.muted,

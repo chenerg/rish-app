@@ -63,7 +63,7 @@ import { RuntimeProgramSheet } from '../components/runtime-program-sheet';
 import { ConversationOptionsPicker } from '../components/ConversationOptionsPicker';
 import { HarnessPicker } from '../components/HarnessPicker';
 import type { StructuredBlock } from '../components/StructuredContent';
-import { projectAgentActivity, projectRoundPreviews } from '../components/agentActivityProjection';
+import { previewArgumentsByCall, projectAgentActivity, projectRoundPreviews } from '../components/agentActivityProjection';
 import { nativeAgentRoundPreviewSource } from '../agent/AgentRoundPreviewSource';
 import type { AgentRoundPreviewState } from '../agent/AgentRoundPreview';
 import { readAgentAttemptPresentation, type AgentAttemptPresentation } from '../agent/AgentRoundPresentation';
@@ -594,7 +594,7 @@ export function displayMessages(
 ): DisplayMessage[] {
   const rendered = (conversation?.messages ?? []).map(message => {
     const attempt = conversation?.attempts.find(item => item.assistantMessageId === message.id);
-    const projectedTools = attempt === undefined ? [] : projectAgentActivity(sessionEvents, attempt.attemptId, presentations[attempt.attemptId], true);
+    const projectedTools = attempt === undefined ? [] : projectAgentActivity(sessionEvents, attempt.attemptId, presentations[attempt.attemptId], true, previewArgumentsByCall(roundPreviews, attempt.attemptId));
     const blocks: StructuredBlock[] | undefined =
       message.role === 'assistant' && message.metadata?.reasoning !== undefined
         ? [
@@ -646,7 +646,7 @@ export function displayMessages(
   const orderedAttempts = conversation.attempts.slice().sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt));
   for (const attempt of orderedAttempts) {
     if (attempt.assistantMessageId !== null) continue;
-    const blocks = projectAgentActivity(sessionEvents, attempt.attemptId, presentations[attempt.attemptId]);
+    const blocks = projectAgentActivity(sessionEvents, attempt.attemptId, presentations[attempt.attemptId], false, previewArgumentsByCall(roundPreviews, attempt.attemptId));
     // Streamed material of rounds still in flight, then a bare "thinking"
     // placeholder while the round is being prepared or sent.
     blocks.push(...projectRoundPreviews(roundPreviews, attempt.attemptId, sessionEvents, presentations[attempt.attemptId], labels));
