@@ -71,7 +71,7 @@ class LocalWorkspacesModule(private val react: ReactApplicationContext) :
     init {
         react.addActivityEventListener(object : BaseActivityEventListener() {
             override fun onActivityResult(
-                activity: Activity?,
+                activity: Activity,
                 requestCode: Int,
                 resultCode: Int,
                 data: Intent?,
