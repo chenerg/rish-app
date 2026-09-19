@@ -10,8 +10,9 @@ export function projectAgentActivity(
   attemptId: string,
   presentation?: AgentAttemptPresentation,
   hasFinalMessage = false,
+  argumentsByCall?: ReadonlyMap<string, string>,
 ): StructuredBlock[] {
-  const tools = projectToolActivity(events, attemptId);
+  const tools = projectToolActivity(events, attemptId, argumentsByCall);
   if (presentation === undefined || presentation.attempt_id !== attemptId) return tools;
   const eventRounds = new Map(events.filter(event => event.attempt_id === attemptId).map(event => [event.event_id, event.round_index]));
   const indexes = new Set<number>();
@@ -28,6 +29,28 @@ export function projectAgentActivity(
     blocks.push(...tools.filter(tool => eventRounds.get(tool.id) === index));
   }
   return blocks;
+}
+
+/**
+ * The streamed arguments of every call one attempt's previews still hold,
+ * keyed the way session events name a call (`roundIndex:callId`). Durable
+ * events carry only the arguments' digest, so this map is where a tool card's
+ * path summary comes from while the round is in memory. Display only.
+ */
+export function previewArgumentsByCall(
+  previews: Readonly<Record<string, AgentRoundPreviewState>>,
+  attemptId: string,
+): ReadonlyMap<string, string> {
+  const map = new Map<string, string>();
+  for (const preview of Object.values(previews)) {
+    if (preview.correlation.attemptId !== attemptId) continue;
+    for (const call of preview.toolCalls) {
+      if (call.id !== null && call.arguments.length > 0) {
+        map.set(`${preview.correlation.roundIndex}:${call.id}`, call.arguments);
+      }
+    }
+  }
+  return map;
 }
 
 /**

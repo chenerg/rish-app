@@ -63,6 +63,7 @@ import type {
   FinalizeAgentAttemptResultV2,
   DiscardAgentAttemptRequestV2,
   DiscardAgentAttemptResultV2,
+  InterruptAgentAttemptResultV2,
   AgentRecoveryTargetV2,
   AgentCancelTargetV2,
   AgentCancelTokenV2,
@@ -290,6 +291,23 @@ export type CompletionController = {
     events?: CompletionControllerEvents,
   ): Promise<CompletionControllerOutcome>;
   resume(
+    conversationId: string,
+    attemptId: string,
+    events?: CompletionControllerEvents,
+  ): Promise<CompletionControllerOutcome>;
+  /**
+   * Give up on an attempt whose round the device cannot resolve, and run the
+   * turn again as a fresh attempt.
+   *
+   * A round that reached the provider and was never answered settles
+   * `ambiguous`, and recovery keeps answering that with manual reconciliation
+   * -- correctly, because the model may already have done the work and
+   * nothing may replay it on its own. This is the person deciding to replay
+   * it. The old attempt is recorded as given up on, its native residue is
+   * settled by the interrupt operation (the only one that may clear an
+   * ambiguous round), and a new attempt in the same turn asks again.
+   */
+  abandonAndRetry(
     conversationId: string,
     attemptId: string,
     events?: CompletionControllerEvents,
@@ -2434,6 +2452,63 @@ export function createCompletionController(
     );
   };
 
+  /**
+   * Clear what an abandoned attempt still owns natively.
+   *
+   * `interrupt_agent_attempt` is the only operation that settles an
+   * `ambiguous` or `unknown` round: a discard refuses one by design, because
+   * a round that may have reached the provider is not residue anybody may
+   * assume away. The session proves the attempt is over -- it now reads
+   * failed with its journal kept -- and the interrupt discards the authority,
+   * reservations, batches and never-dispatched intents with it, so the fresh
+   * attempt that follows prepares over nothing.
+   *
+   * A refusal here is not fatal and is deliberately not reported: the outbox
+   * entry stays durable and the launch drain retries it, while the attempt
+   * is already recorded as given up on.
+   */
+  const settleAbandonedAgentResidue = async (
+    conversationId: string,
+    attemptId: string,
+    runEpoch: number,
+    cleanup: AgentTranscriptCleanupV1,
+  ): Promise<void> => {
+    if (agentRuntime === undefined || !agentAvailable()) return;
+    const authority = dependencies.chat.getSessionAuthority();
+    const operationId = freshOperationId();
+    if (authority === null || operationId === null) return;
+    let settled: InterruptAgentAttemptResultV2;
+    try {
+      settled = await agentRuntime.interruptAgentAttempt({
+        schema_version: 2,
+        operation_id: operationId,
+        cleanup_id: cleanup.cleanup_id,
+        task_id: cleanup.task_id,
+        conversation_id: conversationId,
+        attempt_id: attemptId,
+        transcript_ref: cleanup.transcript_ref,
+        transcript_sha256: cleanup.transcript_sha256,
+        reason: 'failed',
+        expected_session_generation: authority.generation,
+        expected_session_sha256: authority.sessionSha256,
+      });
+    } catch {
+      return;
+    }
+    if (settled.status !== 'discarded' && settled.status !== 'already_missing') {
+      return;
+    }
+    if (runEpoch !== epoch) return;
+    await acknowledgeAgentCleanup(conversationId, attemptId, runEpoch, cleanup, {
+      ...settled,
+      task_id: cleanup.task_id,
+      conversation_id: conversationId,
+      attempt_id: attemptId,
+      transcript_ref: cleanup.transcript_ref,
+      transcript_sha256: cleanup.transcript_sha256,
+    });
+  };
+
   const acknowledgeAgentCleanup = async (
     conversationId: string,
     attemptId: string,
@@ -2642,6 +2717,12 @@ export function createCompletionController(
           : result.status === 'unknown'
             ? 'unknown'
             : 'ambiguous';
+    // A failed or cancelled round ends the attempt. The store keeps terminal
+    // Agent phases on the atomic final checkpoint -- the ordinary controller
+    // checkpoint refuses them outright -- so those two commit through
+    // `completeAgentAttempt` with no assistant message, exactly as a settled
+    // cancellation does.
+    const terminal = phase === 'failed' || phase === 'cancelled';
     const nextJournal: PersistedAgentAttemptJournalV3 = {
       ...copyAgentJournal(current),
       phase,
@@ -2665,24 +2746,43 @@ export function createCompletionController(
     if (eventId === null) {
       return await failAgentWithoutNative(conversationId, attemptId, 'E_AGENT_PERSISTENCE');
     }
-    const event = agentEvent(
-      attemptId,
-      eventId,
-      'round',
-      request.round_index,
-      null,
-      'running',
-      null,
-      null,
-      null,
-      null,
-      null,
-      transitionCreatedAt,
-    );
+    // The atomic final checkpoint reads one terminal event and matches every
+    // field of it, including the failure code the reducer derives: a round
+    // that failed retryably carries no completion receipt, so the code is
+    // always E_AGENT_PERSISTENCE.
+    const event = terminal
+      ? agentEvent(
+          attemptId,
+          eventId,
+          'terminal',
+          null,
+          null,
+          phase === 'cancelled' ? 'cancelled' : 'failed',
+          null,
+          null,
+          null,
+          null,
+          phase === 'cancelled' ? 'E_AGENT_CANCELLED' : 'E_AGENT_PERSISTENCE',
+          transitionCreatedAt,
+        )
+      : agentEvent(
+          attemptId,
+          eventId,
+          'round',
+          request.round_index,
+          null,
+          'running',
+          null,
+          null,
+          null,
+          null,
+          null,
+          transitionCreatedAt,
+        );
     // Unknown/ambiguous rounds still own unresolved native evidence. Only a
     // settled failed/cancelled journal may enqueue transcript cleanup; the
     // store deliberately rejects cleanup on the unresolved checkpoints.
-    const needsCleanup = phase === 'failed' || phase === 'cancelled';
+    const needsCleanup = terminal;
     const cleanup = needsCleanup
         ? agentCleanupFor(
             conversationId,
@@ -2698,14 +2798,15 @@ export function createCompletionController(
     const cas = authorityFor(located.attempt, conversationId);
     if (cas === null) return await failAgentWithoutNative(conversationId, attemptId, 'E_AGENT_PERSISTENCE');
     const transaction =
-      phase === 'cancelled'
-        ? dependencies.chat.cancelAgentAttempt({
+      terminal && cleanup !== null && cleanup !== undefined
+        ? dependencies.chat.completeAgentAttempt({
             cas,
             expectedAttempt: located.attempt,
             journal: nextJournal,
             events: [event],
             evidence,
-            ...(cleanup === null || cleanup === undefined ? {} : { cleanup }),
+            assistantMessage: null,
+            cleanup,
           })
         : dependencies.chat.failAgentAttempt({
             cas,
@@ -2713,7 +2814,6 @@ export function createCompletionController(
             journal: nextJournal,
             events: [event],
             evidence,
-            ...(cleanup === null || cleanup === undefined ? {} : { cleanup }),
           });
     if (transaction === null) return await failAgentWithoutNative(conversationId, attemptId, 'E_AGENT_CONFLICT');
     if (phase !== 'round_in_flight' && cleanup !== null && cleanup !== undefined) {
@@ -2739,7 +2839,7 @@ export function createCompletionController(
         if (agentRuntime === undefined) return outcome('cancelled', state);
         // A cancelled/unknown/ambiguous round is never re-executed. Keep the
         // durable terminal candidate visible; recovery owns any later probe.
-        if (phase === 'cancelled' && cleanup !== null && cleanup !== undefined) {
+        if (terminal && cleanup !== null && cleanup !== undefined) {
           const finalized = await finalizeAgent(
             conversationId,
             attemptId,
@@ -4422,6 +4522,22 @@ export function createCompletionController(
         idempotency_key: call.idempotency_key,
       };
     }
+    // A round whose outcome this journal already carries has nothing left to
+    // reconcile, and asking about it is not merely useless: the round
+    // selector binds the request's transcript to the row's *before*
+    // transcript, and a committed round has moved the journal past it. Every
+    // recovery of an attempt waiting on an approval therefore answered
+    // E_AGENT_CONFLICT instead of putting the question back on screen. The
+    // attempt itself is the right target: the query already says where the
+    // turn stands, and the controller resumes from there.
+    if (lineage.status === 'completed') {
+      return {
+        schema_version: 2,
+        kind: 'attempt',
+        task_id: attempt.turnId,
+        attempt_id: attempt.attemptId,
+      };
+    }
     return {
       schema_version: 2,
       kind: 'round',
@@ -4695,6 +4811,13 @@ export function createCompletionController(
       const recoveredBatchAuthority = agentBatchAuthorityFromProjection(recovered.attempt);
       if (recoveredBatchAuthority !== null) {
         updateAgentRun({ batchAuthority: recoveredBatchAuthority });
+      }
+      // Approval tokens live only in this run, and a recovery is a new run:
+      // without taking them back from the projection a turn recovered while
+      // it was waiting for a person could never ask again, because the call
+      // it wanted approved had no token to show.
+      if (agentRun !== null) {
+        agentRun = rememberAgentTokens(agentRun, recovered.attempt.batch);
       }
       if (recoveredJournal.phase === 'ready_for_round' || recoveredJournal.phase === 'tool_result_pending') return await runAgentRound(conversationId, attemptId, runEpoch);
       if (recoveredJournal.phase === 'batch_frozen' || recoveredJournal.phase === 'approval_pending') return await runAgentBatch(conversationId, attemptId, runEpoch);
@@ -5219,6 +5342,124 @@ export function createCompletionController(
         attemptId,
         events,
         epoch,
+      );
+    },
+    abandonAndRetry: async (conversationId, attemptId, events = {}) => {
+      if (destructiveJournalActive()) {
+        return busyOutcome(conversationId, attemptId);
+      }
+      if (
+        active !== null ||
+        agentRun !== null ||
+        pendingPreparation !== null ||
+        pendingAgentPersistence !== null ||
+        pendingAgentCleanup !== null ||
+        pendingCommit !== null ||
+        pendingTerminal !== null ||
+        retryPersistenceInFlight ||
+        retryCommitInFlight ||
+        state.phase === 'cancelling'
+      ) {
+        return busyOutcome(conversationId, attemptId);
+      }
+      const located = getConversationAttempt(conversationId, attemptId);
+      const journal = located?.attempt.agent ?? null;
+      // Only the two answers recovery cannot resolve by itself. Everything
+      // else is resumed, retried or already over, and has its own path.
+      if (
+        located === undefined ||
+        located === null ||
+        journal === undefined ||
+        journal === null ||
+        (journal.phase !== 'ambiguous' && journal.phase !== 'unknown')
+      ) {
+        publish(
+          stateFor('blocked', {
+            conversationId,
+            attemptId,
+            failureCode: 'E_COMPLETION_RESULT_CORRELATION',
+          }),
+        );
+        return outcome('blocked', state);
+      }
+      const { attempt } = located;
+      epoch += 1;
+      const runEpoch = epoch;
+      const cleanup = agentCleanupFor(
+        conversationId,
+        attempt,
+        journal,
+        'failed',
+        canonicalNow(dependencies.now),
+      );
+      if (cleanup === null) {
+        publish(
+          stateFor('blocked', {
+            conversationId,
+            turnId: attempt.turnId,
+            attemptId,
+            failureCode: 'E_AGENT_PERSISTENCE',
+          }),
+        );
+        return outcome('blocked', state);
+      }
+      const transaction = dependencies.chat.abandonUnresolvedAgentAttempt({
+        conversationId,
+        attemptId,
+        expectedAttempt: attempt,
+        cleanup,
+      });
+      if (transaction === null) {
+        publish(
+          stateFor('blocked', {
+            conversationId,
+            turnId: attempt.turnId,
+            attemptId,
+            failureCode: 'E_AGENT_CONFLICT',
+          }),
+        );
+        return outcome('blocked', state);
+      }
+      // Each of the three steps owns the controller's single pending-persist
+      // slot in turn, so they cannot be nested: the fresh turn is begun after
+      // the abandonment has committed, not inside its continuation.
+      const abandoned = await safeAgentPersist(
+        transaction,
+        async () => outcome('retryable', state),
+        runEpoch,
+        { conversationId, turnId: attempt.turnId, attemptId },
+        'checkpoint',
+      );
+      if (abandoned.status !== 'retryable' || runEpoch !== epoch) {
+        return abandoned;
+      }
+      await settleAbandonedAgentResidue(
+        conversationId,
+        attemptId,
+        runEpoch,
+        cleanup,
+      );
+      if (runEpoch !== epoch) return outcome('cancelled', state);
+      const retryTransaction = dependencies.chat.retryAttempt(
+        conversationId,
+        attemptId,
+      );
+      if (retryTransaction === null) {
+        publish(
+          stateFor('blocked', {
+            conversationId,
+            turnId: attempt.turnId,
+            attemptId,
+            failureCode: 'E_COMPLETION_RESULT_CORRELATION',
+          }),
+        );
+        return outcome('blocked', state);
+      }
+      return await beginTransaction(
+        retryTransaction,
+        conversationId,
+        events,
+        runEpoch,
       );
     },
     retryPersistence: async () => {

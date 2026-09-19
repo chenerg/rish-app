@@ -1,6 +1,10 @@
 package tech.zseven.rish.modules
 
+import android.app.Activity
+import android.content.Intent
+import android.net.Uri
 import com.facebook.react.bridge.Arguments
+import com.facebook.react.bridge.BaseActivityEventListener
 import com.facebook.react.bridge.Promise
 import com.facebook.react.bridge.ReactApplicationContext
 import com.facebook.react.bridge.ReactContextBaseJavaModule
@@ -9,10 +13,14 @@ import com.facebook.react.bridge.ReadableMap
 import org.json.JSONArray
 import org.json.JSONObject
 import tech.zseven.rish.RishUnavailable
+import tech.zseven.rish.runtime.AndroidDebugLog
 import tech.zseven.rish.runtime.AndroidRuntimeState
 import tech.zseven.rish.runtime.AndroidWorkspaceRegistry
 import tech.zseven.rish.runtime.RishAgentCoreNative
 import tech.zseven.rish.runtime.RuntimeJson
+import java.io.File
+import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * LocalWorkspaces on Android.
@@ -23,17 +31,62 @@ import tech.zseven.rish.runtime.RuntimeJson
  * in [AndroidWorkspaceRegistry]; this is the wire between them and the bridge,
  * and it decides nothing of its own.
  *
- * A person can make a workspace here and an agent can work inside it: create,
- * list, resolve and the operation query are real. Binding a folder the person
- * chose is not: that needs the Storage Access Framework, whose grants are a
- * different thing from an owned directory, and it keeps refusing until that
- * lands rather than pretending a picker appeared.
+ * A person can make a workspace, grant one, or import one. The folder picker
+ * is the Storage Access Framework's document-tree picker:
+ *
+ * - **Open in place** takes the persistable grant and binds the tree URI as a
+ *   `granted_folder` workspace — resolved ever after through that URI, never
+ *   through a POSIX path it does not have.
+ * - **Import** copies the tree into an app-owned workspace, staged first so a
+ *   half-finished copy is thrown away rather than published.
+ * - A provider-managed location, an import-only request, or an OEM that
+ *   refuses to persist the grant all settle as `requires_import`: the person
+ *   is told the folder can be copied but not bound, which is the truth.
+ *
+ * One picker may be pending at a time. A newer `presentFolderPicker` settles
+ * the older one as cancelled instead of refusing busy forever, and
+ * `cancelPicker` settles it by operation id — the two fixes that ended the
+ * sticky BUSY/UNAVAILABLE states the first device iteration hit.
  */
 class LocalWorkspacesModule(private val react: ReactApplicationContext) :
     ReactContextBaseJavaModule(react) {
 
     private val runtime by lazy { AndroidRuntimeState.get(react) }
     private val registry: AndroidWorkspaceRegistry get() = runtime.workspaces
+
+    /** The one picker that may be waiting on the system UI. */
+    private class PendingPicker(val operationId: String, val mode: String, val promise: Promise)
+
+    /** A folder the person chose that still awaits import or cancellation. */
+    private class Selection(
+        val uri: Uri,
+        val displayName: String,
+        val expiresAt: Long,
+    )
+
+    private val pickerLock = Any()
+    private var pendingPicker: PendingPicker? = null
+    private val selections = ConcurrentHashMap<String, Selection>()
+
+    init {
+        react.addActivityEventListener(object : BaseActivityEventListener() {
+            override fun onActivityResult(
+                activity: Activity,
+                requestCode: Int,
+                resultCode: Int,
+                data: Intent?,
+            ) {
+                if (requestCode != PICKER_REQUEST) return
+                val picker = synchronized(pickerLock) {
+                    pendingPicker.also { pendingPicker = null }
+                } ?: return
+                val uri = if (resultCode == Activity.RESULT_OK) data?.data else null
+                // The classification below queries the provider; that is not
+                // main-thread work.
+                runtime.io.execute { settlePicker(picker, uri) }
+            }
+        })
+    }
 
     /**
      * Without the core there are no rules to ask, so there is nothing this
@@ -156,31 +209,347 @@ class LocalWorkspacesModule(private val react: ReactApplicationContext) :
             ?: throw AndroidWorkspaceRegistry.Refused(NOT_FOUND)
     }
 
+    // --- the folder picker --------------------------------------------------
+
+    @ReactMethod
+    fun presentFolderPicker(request: ReadableMap?, promise: Promise) {
+        val fields = try {
+            request(request, "schema_version", "operation_id", "mode")
+        } catch (error: Throwable) {
+            return reject(promise, error)
+        }
+        val operationId: String
+        val mode: String
+        try {
+            operationId = text(fields, "operation_id")
+            mode = text(fields, "mode")
+            if (!RuntimeJson.uuid(operationId)) throw AndroidWorkspaceRegistry.Refused(INVALID)
+            if (mode != "grant_or_import" && mode != "import_only") {
+                throw AndroidWorkspaceRegistry.Refused(INVALID)
+            }
+        } catch (error: Throwable) {
+            return reject(promise, error)
+        }
+        if (!RishAgentCoreNative.available) {
+            return promise.reject(UNAVAILABLE, UNAVAILABLE)
+        }
+        val activity = react.currentActivity
+        if (activity == null) {
+            // No activity means no system UI to show; saying so is the fix
+            // for the old sticky UNAVAILABLE, which refused before looking.
+            AndroidDebugLog.log("saf_picker", "no_activity", operationId)
+            return promise.reject(UNAVAILABLE, UNAVAILABLE)
+        }
+        // A newer picker settles the older one as cancelled: JavaScript has
+        // already invalidated it, and holding BUSY forever was the bug.
+        val superseded = synchronized(pickerLock) {
+            val previous = pendingPicker
+            pendingPicker = PendingPicker(operationId, mode, promise)
+            previous
+        }
+        superseded?.let {
+            AndroidDebugLog.log("saf_picker", "superseded", it.operationId)
+            resolve(it.promise, cancelledResult())
+        }
+        AndroidDebugLog.log("saf_picker", "presenting", "$operationId $mode")
+        try {
+            val intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE)
+                .addFlags(
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                        Intent.FLAG_GRANT_WRITE_URI_PERMISSION or
+                        Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION,
+                )
+            activity.startActivityForResult(intent, PICKER_REQUEST)
+        } catch (_: Exception) {
+            val current = synchronized(pickerLock) {
+                pendingPicker.takeIf { it?.operationId == operationId }
+                    .also { if (it != null) pendingPicker = null }
+            }
+            AndroidDebugLog.log("saf_picker", "present_failed", operationId)
+            current?.promise?.reject(UNAVAILABLE, UNAVAILABLE)
+        }
+    }
+
+    /** What became of the picker the system UI answered. Runs off-main. */
+    private fun settlePicker(picker: PendingPicker, uri: Uri?) {
+        try {
+            if (uri == null) {
+                AndroidDebugLog.log("saf_picker", "cancelled", picker.operationId)
+                return resolve(picker.promise, cancelledResult())
+            }
+            val access = runtime.safAccess
+            val persisted = access.persistGrant(uri)
+            AndroidDebugLog.log(
+                "saf_picker",
+                if (persisted) "grant_persisted" else "grant_not_persistable",
+                picker.operationId,
+            )
+            val rootNode = access.treeRoot(uri)
+            val displayName = displayNameFor(rootNode?.name, uri)
+            val providerManaged = uri.authority != LOCAL_DOCUMENTS_AUTHORITY
+            if (picker.mode == "grant_or_import" && persisted && !providerManaged && rootNode != null) {
+                try {
+                    val record = registry.bindGrantedFolder(
+                        displayName = displayName,
+                        treeUri = uri.toString(),
+                        treeDocumentId = rootNode.documentId,
+                        operationId = picker.operationId,
+                    )
+                    val descriptor = descriptorOrRefuse(record.getString("workspace_id"))
+                    AndroidDebugLog.log("saf_picker", "selected_in_place", picker.operationId)
+                    return resolve(
+                        picker.promise,
+                        JSONObject().put("schema_version", 1).put("status", "selected")
+                            .put("workspace", descriptor),
+                    )
+                } catch (error: Throwable) {
+                    // A folder that cannot be bound can still be copied; the
+                    // person is offered the truth rather than a dead end.
+                    AndroidDebugLog.log(
+                        "saf_picker", "bind_failed",
+                        (error as? AndroidWorkspaceRegistry.Refused)?.code ?: "unexpected",
+                    )
+                }
+            }
+            val selectionId = UUID.randomUUID().toString()
+            selections[selectionId] = Selection(
+                uri = uri,
+                displayName = displayName,
+                expiresAt = System.currentTimeMillis() + SELECTION_TTL_MS,
+            )
+            AndroidDebugLog.log("saf_picker", "requires_import", picker.operationId)
+            resolve(
+                picker.promise,
+                JSONObject().put("schema_version", 1).put("status", "requires_import")
+                    .put("selection_id", selectionId)
+                    .put("display_name", displayName)
+                    .put(
+                        "location_class",
+                        if (providerManaged) "provider_managed" else "unknown",
+                    ),
+            )
+        } catch (error: Throwable) {
+            reject(picker.promise, error)
+        }
+    }
+
+    @ReactMethod
+    fun importSelection(request: ReadableMap?, promise: Promise) {
+        runtime.io.execute {
+            try {
+                if (!RishAgentCoreNative.available) throw AndroidWorkspaceRegistry.Refused(UNAVAILABLE)
+                val fields = request(request, "schema_version", "selection_id", "operation_id")
+                val selectionId = text(fields, "selection_id")
+                val operationId = text(fields, "operation_id")
+                if (!RuntimeJson.uuid(selectionId) || !RuntimeJson.uuid(operationId)) {
+                    throw AndroidWorkspaceRegistry.Refused(INVALID)
+                }
+                val selection = selections[selectionId]
+                if (selection == null || selection.expiresAt < System.currentTimeMillis()) {
+                    selections.remove(selectionId)
+                    // The one honest replay: an import that already committed
+                    // answers with the workspace it made.
+                    val replayed = replayedImport(operationId)
+                        ?: throw AndroidWorkspaceRegistry.Refused(STALE)
+                    return@execute resolve(promise, replayed)
+                }
+                AndroidDebugLog.log("saf_import", "copy_started", selectionId)
+                val staging = File(
+                    registry.root,
+                    ".rish-import-$selectionId",
+                )
+                try {
+                    copyTree(selection.uri, staging)
+                    val record = registry.create(
+                        displayName = selection.displayName,
+                        operationId = operationId,
+                        origin = "imported",
+                    )
+                    val target = registry.rootFor(record.getString("workspace_id"))
+                        ?: throw AndroidWorkspaceRegistry.Refused(PERSISTENCE)
+                    moveChildren(staging, target)
+                    selections.remove(selectionId)
+                    AndroidDebugLog.log("saf_import", "committed", record.getString("workspace_id"))
+                    resolve(promise, descriptorOrRefuse(record.getString("workspace_id")))
+                } finally {
+                    staging.deleteRecursively()
+                }
+            } catch (error: Throwable) {
+                AndroidDebugLog.log(
+                    "saf_import", "failed",
+                    (error as? AndroidWorkspaceRegistry.Refused)?.code ?: "unexpected",
+                )
+                reject(promise, error)
+            }
+        }
+    }
+
+    @ReactMethod
+    fun cancelSelection(request: ReadableMap?, promise: Promise) {
+        try {
+            val fields = request(request, "schema_version", "selection_id")
+            val selectionId = text(fields, "selection_id")
+            val removed = selections.remove(selectionId) != null
+            AndroidDebugLog.log(
+                "saf_picker",
+                if (removed) "selection_cancelled" else "selection_already_settled",
+                selectionId,
+            )
+            resolve(
+                promise,
+                JSONObject().put("schema_version", 1)
+                    .put("status", if (removed) "cancelled" else "already_settled"),
+            )
+        } catch (error: Throwable) {
+            reject(promise, error)
+        }
+    }
+
+    @ReactMethod
+    fun cancelPicker(request: ReadableMap?, promise: Promise) {
+        try {
+            val fields = request(request, "schema_version", "operation_id")
+            val operationId = text(fields, "operation_id")
+            val cancelled = synchronized(pickerLock) {
+                val current = pendingPicker
+                if (current?.operationId == operationId) {
+                    pendingPicker = null
+                    current
+                } else {
+                    null
+                }
+            }
+            cancelled?.let { resolve(it.promise, cancelledResult()) }
+            AndroidDebugLog.log(
+                "saf_picker",
+                if (cancelled != null) "picker_cancelled" else "picker_already_settled",
+                operationId,
+            )
+            resolve(
+                promise,
+                JSONObject().put("schema_version", 1)
+                    .put("status", if (cancelled != null) "cancelled" else "already_settled"),
+            )
+        } catch (error: Throwable) {
+            reject(promise, error)
+        }
+    }
+
+    private fun cancelledResult(): JSONObject =
+        JSONObject().put("schema_version", 1).put("status", "cancelled")
+
+    /** The already-committed import this operation id names, if any. */
+    private fun replayedImport(operationId: String): JSONObject? {
+        val receipt = registry.queryOperation(operationId) ?: return null
+        if (receipt.optString("status") != "committed") return null
+        val workspaceId = receipt.optJSONObject("receipt")?.optString("workspace_id")
+            ?: return null
+        return registry.descriptor(workspaceId)
+    }
+
+    /**
+     * A display name the record rules accept, from whatever the provider
+     * said the folder is called. Sanitising, not judging: forbidden
+     * characters become dashes, and a name nothing survives of becomes
+     * "Folder".
+     */
+    private fun displayNameFor(providerName: String?, uri: Uri): String {
+        val raw = providerName?.takeIf { it.isNotBlank() }
+            ?: uri.lastPathSegment?.substringAfterLast(':')?.substringAfterLast('/')
+            ?: ""
+        val normalized = java.text.Normalizer.normalize(raw, java.text.Normalizer.Form.NFC)
+        val cleaned = buildString {
+            for (character in normalized) {
+                val forbidden = character == '/' || character == '\\' || character == ':' ||
+                    character.isISOControl() ||
+                    Character.getType(character) == Character.FORMAT.toInt()
+                append(if (forbidden) '-' else character)
+            }
+        }.trim().trimStart('.')
+        val bounded = StringBuilder()
+        var bytes = 0
+        for (character in cleaned) {
+            val width = character.toString().toByteArray(Charsets.UTF_8).size
+            if (bytes + width > 120) break
+            bounded.append(character)
+            bytes += width
+        }
+        var candidate = bounded.toString().trim()
+        if (candidate.isEmpty()) candidate = "Folder"
+        val folded = AndroidWorkspaceRegistry.folded(candidate)
+        if (folded == "rish workspaces" || folded.startsWith(".rish-")) {
+            candidate = "Folder $candidate".take(60)
+        }
+        return candidate
+    }
+
+    /**
+     * Copies one granted tree into [into], bounded in entries, bytes and
+     * depth so a pathological tree refuses instead of filling the device.
+     */
+    private fun copyTree(tree: Uri, into: File) {
+        val access = runtime.safAccess
+        val root = access.treeRoot(tree)
+            ?: throw AndroidWorkspaceRegistry.Refused(STALE)
+        if (!root.isDirectory) throw AndroidWorkspaceRegistry.Refused(STALE)
+        if (into.exists()) into.deleteRecursively()
+        if (!into.mkdirs()) throw AndroidWorkspaceRegistry.Refused(PERSISTENCE)
+        var entries = 0
+        var bytes = 0L
+        fun walk(parentId: String, destination: File, depth: Int) {
+            if (depth > MAX_IMPORT_DEPTH) throw AndroidWorkspaceRegistry.Refused(BUSY)
+            val children = access.children(tree, parentId)
+                ?: throw AndroidWorkspaceRegistry.Refused(PERSISTENCE)
+            for (child in children) {
+                val name = child.name
+                if (name.isEmpty() || name == "." || name == ".." ||
+                    name.contains('/') || name.contains('\u0000')
+                ) {
+                    continue
+                }
+                entries += 1
+                if (entries > MAX_IMPORT_ENTRIES) throw AndroidWorkspaceRegistry.Refused(BUSY)
+                val target = File(destination, name)
+                if (child.isDirectory) {
+                    if (!target.isDirectory && !target.mkdir()) {
+                        throw AndroidWorkspaceRegistry.Refused(PERSISTENCE)
+                    }
+                    walk(child.documentId, target, depth + 1)
+                } else {
+                    bytes += child.size
+                    if (bytes > MAX_IMPORT_BYTES) throw AndroidWorkspaceRegistry.Refused(BUSY)
+                    val stream = access.openForCopy(tree, child.documentId)
+                        ?: throw AndroidWorkspaceRegistry.Refused(PERSISTENCE)
+                    stream.use { input ->
+                        target.outputStream().use { output -> input.copyTo(output) }
+                    }
+                }
+            }
+        }
+        walk(root.documentId, into, 0)
+    }
+
+    /** Moves every staged child into the workspace directory by rename. */
+    private fun moveChildren(staging: File, target: File) {
+        val children = staging.listFiles() ?: return
+        for (child in children) {
+            if (!child.renameTo(File(target, child.name))) {
+                throw AndroidWorkspaceRegistry.Refused(PERSISTENCE)
+            }
+        }
+    }
+
     // --- not yet on Android ------------------------------------------------
     //
-    // Choosing a folder outside the app needs the Storage Access Framework,
-    // and a persisted tree grant is not an owned directory: it can be revoked,
-    // it has no POSIX path, and the guest cannot read it the way it reads one.
-    // Until that is built these refuse, because a picker that never appeared
-    // is not a cancelled picker.
-
-    @ReactMethod
-    fun presentFolderPicker(request: ReadableMap?, promise: Promise) = refuseUnbuilt(promise)
-
-    @ReactMethod
-    fun importSelection(request: ReadableMap?, promise: Promise) = refuseUnbuilt(promise)
-
-    @ReactMethod
-    fun cancelSelection(request: ReadableMap?, promise: Promise) = refuseUnbuilt(promise)
+    // Rebinding a granted folder that lost its grant needs a compare between
+    // the old tree and a newly picked one; until that lands these refuse,
+    // because a picker that never appeared is not a cancelled picker.
 
     @ReactMethod
     fun presentRegrantPicker(request: ReadableMap?, promise: Promise) = refuseUnbuilt(promise)
 
     @ReactMethod
     fun completeRegrant(request: ReadableMap?, promise: Promise) = refuseUnbuilt(promise)
-
-    @ReactMethod
-    fun cancelPicker(request: ReadableMap?, promise: Promise) = refuseUnbuilt(promise)
 
     @ReactMethod
     fun bootstrapLegacyProject(request: ReadableMap?, promise: Promise) = refuseUnbuilt(promise)
@@ -208,5 +577,20 @@ class LocalWorkspacesModule(private val react: ReactApplicationContext) :
         const val STALE = "E_WORKSPACE_STALE"
         const val CAPABILITY = "E_WORKSPACE_CAPABILITY"
         const val NOT_FOUND = "E_WORKSPACE_NOT_FOUND"
+        const val PERSISTENCE = "E_WORKSPACE_PERSISTENCE"
+        const val BUSY = "E_WORKSPACE_BUSY"
+
+        /** The request code the document-tree picker answers with. */
+        const val PICKER_REQUEST = 0x5AF1
+
+        /** The native picker keeps a selection alive for at most five minutes. */
+        const val SELECTION_TTL_MS = 5L * 60 * 1000
+
+        /** The system documents provider over local storage: bindable in place. */
+        const val LOCAL_DOCUMENTS_AUTHORITY = "com.android.externalstorage.documents"
+
+        const val MAX_IMPORT_ENTRIES = 20_000
+        const val MAX_IMPORT_BYTES = 256L * 1024 * 1024
+        const val MAX_IMPORT_DEPTH = 32
     }
 }

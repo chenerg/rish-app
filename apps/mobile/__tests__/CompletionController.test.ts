@@ -1453,6 +1453,10 @@ describe('project Agent completion controller', () => {
   const AGENT_MESSAGE = '20202020-2020-4202-8202-202020202020';
   const AGENT_TURN = '30303030-3030-4303-8303-303030303030';
   const AGENT_ATTEMPT = '40404040-4040-4404-8404-404040404040';
+  // A second attempt in the same turn -- only a retry after an abandoned
+  // agent attempt asks for one, and it must not reuse the first attempt's id.
+  const AGENT_RETRY_ATTEMPT = '41414141-4141-4414-8414-414141414141';
+  const AGENT_RETRY_TRANSCRIPT = '71717171-7171-4717-8717-717171717171';
   const AGENT_WORKSPACE = '50505050-5050-4505-8505-505050505050';
   const AGENT_PROJECT = '60606060-6060-4606-8606-606060606060';
   const AGENT_TRANSCRIPT = '70707070-7070-4707-8707-707070707070';
@@ -1485,6 +1489,7 @@ describe('project Agent completion controller', () => {
 
   function agentStore(model: HarnessModelId = 'deepseek-v4-flash') {
     let messageUsed = false;
+    let attemptUsed = false;
     const options: Parameters<typeof createChatStore>[0] = {
       now: () => NOW,
       sessionAuthority: { generation: 1, sessionSha256: SHA },
@@ -1496,8 +1501,15 @@ describe('project Agent completion controller', () => {
         }
         return IDS.shift() ?? AGENT_MESSAGE;
       },
-      createLifecycleId: kind =>
-        kind === 'turn' ? AGENT_TURN : kind === 'attempt' ? AGENT_ATTEMPT : (IDS.shift() ?? AGENT_TURN),
+      createLifecycleId: kind => {
+        if (kind === 'turn') return AGENT_TURN;
+        if (kind === 'attempt') {
+          const first = !attemptUsed;
+          attemptUsed = true;
+          return first ? AGENT_ATTEMPT : AGENT_RETRY_ATTEMPT;
+        }
+        return IDS.shift() ?? AGENT_TURN;
+      },
     };
     const base = createChatStore(options);
     const conversationId = base.createConversation({ workspaceId: AGENT_WORKSPACE, projectId: AGENT_PROJECT });
@@ -1661,13 +1673,31 @@ describe('project Agent completion controller', () => {
         grant.policy_version === policy.policy_version,
       ) ?? null;
     };
-    const transcript = (generation: number, digest: string): AgentRuntimeTranscriptHandleV1 => ({
+    const transcript = (
+      generation: number,
+      digest: string,
+      ref: string = options.transcriptRef ?? AGENT_TRANSCRIPT,
+    ): AgentRuntimeTranscriptHandleV1 => ({
       schema_version: 1,
-      transcript_ref: options.transcriptRef ?? AGENT_TRANSCRIPT,
+      transcript_ref: ref,
       generation,
       transcript_sha256: digest,
       transcript_bytes: generation * 10,
     });
+    // Native mints one transcript per attempt, and the store refuses a
+    // second attempt that reuses the first one's ref -- which is how it keeps
+    // an abandoned attempt's evidence its own.
+    const transcriptRefs = new Map<string, string>();
+    const transcriptRefFor = (attemptId: string): string => {
+      const known = transcriptRefs.get(attemptId);
+      if (known !== undefined) return known;
+      const minted =
+        transcriptRefs.size === 0
+          ? options.transcriptRef ?? AGENT_TRANSCRIPT
+          : AGENT_RETRY_TRANSCRIPT;
+      transcriptRefs.set(attemptId, minted);
+      return minted;
+    };
     const prepareAgentAttempt = jest.fn(async (request: PrepareAgentAttemptRequestV2) => ({
       schema_version: 2 as const,
       status: 'prepared' as const,
@@ -1684,7 +1714,7 @@ describe('project Agent completion controller', () => {
         root,
         policy,
         registry,
-        transcript: transcript(0, SHA),
+        transcript: transcript(0, SHA, transcriptRefFor(request.attempt_id)),
         round_index: 0,
         round_id: null,
         round_revision: null,
@@ -1708,6 +1738,7 @@ describe('project Agent completion controller', () => {
       const nextTranscript = transcript(
         nextGeneration,
         final ? '9'.repeat(64) : nextGeneration.toString(16).slice(-1).repeat(64),
+        request.transcript.transcript_ref,
       );
       const completionReceipt: AgentRoundReceiptV2 = {
         schema_version: 2,
@@ -1918,7 +1949,7 @@ describe('project Agent completion controller', () => {
         };
       });
       const refusedTranscript = refused
-        ? transcript(request.transcript.generation + callsForRound.length, (request.transcript.generation + callsForRound.length).toString(16).slice(-1).repeat(64))
+        ? transcript(request.transcript.generation + callsForRound.length, (request.transcript.generation + callsForRound.length).toString(16).slice(-1).repeat(64), request.transcript.transcript_ref)
         : request.transcript;
       const batchKind = hasMutation && !refused ? 'write_batch' : 'read_only_batch';
       const batchNewWriteBytes = hasMutation ? 1 : 0;
@@ -2371,7 +2402,221 @@ describe('project Agent completion controller', () => {
     } finally { jest.useRealTimers(); }
   });
 
+  /**
+   * A round the provider never answered ends the attempt. The store keeps
+   * terminal Agent phases on the atomic final checkpoint, so a failed round
+   * that was checkpointed through the ordinary controller transaction was
+   * refused outright: the journal stayed `round_in_flight`, the attempt stayed
+   * `sending`, and the turn could neither finish nor be recovered.
+   */
+  /**
+   * A round that reached the provider and was never answered is `ambiguous`,
+   * and recovery answers that with manual reconciliation forever -- rightly,
+   * since the model may already have done the work. Giving up on the attempt
+   * is the one decision only a person can make, and it has to leave the turn
+   * askable again: the old attempt recorded as a dead writer's is, its
+   * native residue settled by the interrupt (the only operation that clears
+   * an ambiguous round), and a fresh attempt in the same turn.
+   */
+  test('giving up on an unresolved round settles it and asks the turn again', async () => {
+    const store = agentStore();
+    const runtime = makeRuntime([]);
+    (runtime.completeAgentRoundV2 as jest.Mock).mockImplementationOnce(async (request: CompleteAgentRoundRequestV2) => ({
+      schema_version: 2,
+      status: 'ambiguous',
+      operation_id: request.operation_id,
+      task_id: request.task_id,
+      attempt_id: request.attempt_id,
+      round_id: request.round_id,
+      round_index: request.round_index,
+      launch_attempt: request.launch_attempt,
+      result_round_revision: 1,
+      transcript: request.transcript,
+      failure_code: 'E_AGENT_ROUND_AMBIGUOUS',
+    }));
+    (runtime.interruptAgentAttempt as jest.Mock).mockImplementation(async (request: any) => ({
+      schema_version: 2 as const,
+      status: 'discarded' as const,
+      operation_id: request.operation_id,
+      cleanup_id: request.cleanup_id,
+    }));
+    const controller = agentController(store, runtime, committedPersistence(store));
+    const conversationId = store.getState().selectedConversationId!;
+    await controller.send({ conversationId, text: 'unresolved round', attachments: [] });
+    const attempts = store.getState().conversations[conversationId]!.attempts;
+    expect(attempts).toHaveLength(1);
+    const unresolved = attempts[0]!;
+    expect(unresolved.agent!.phase).toBe('ambiguous');
+
+    await controller.abandonAndRetry(conversationId, unresolved.attemptId);
+
+    const after = store.getState().conversations[conversationId]!;
+    const abandoned = after.attempts.find(
+      attempt => attempt.attemptId === unresolved.attemptId,
+    )!;
+    // Recorded exactly as a dead writer's attempt is, journal kept: that is
+    // the one failure code the retry reducer accepts a journal with.
+    expect(abandoned.status).toBe('failed');
+    expect(abandoned.failureCode).toBe('E_ATTEMPT_INTERRUPTED');
+    expect(abandoned.agent).not.toBeNull();
+    // The residue was settled and the outbox entry acknowledged, rather than
+    // left for the next launch.
+    expect(runtime.interruptAgentAttempt).toHaveBeenCalledTimes(1);
+    expect(store.getState().agentTranscriptCleanupOutbox ?? []).toHaveLength(0);
+    // And the turn asked again, in the same turn, with a second round.
+    expect(after.attempts).toHaveLength(2);
+    const fresh = after.attempts[1]!;
+    expect(fresh.turnId).toBe(unresolved.turnId);
+    expect(fresh.attemptId).not.toBe(unresolved.attemptId);
+    expect(runtime.completeAgentRoundV2).toHaveBeenCalledTimes(2);
+  });
+
+  test('a round that failed retryably ends the attempt instead of leaving it sending', async () => {
+    const store = agentStore();
+    const runtime = makeRuntime([]);
+    (runtime.completeAgentRoundV2 as jest.Mock).mockImplementationOnce(async (request: CompleteAgentRoundRequestV2) => ({
+      schema_version: 2,
+      status: 'failed_retryable',
+      operation_id: request.operation_id,
+      task_id: request.task_id,
+      attempt_id: request.attempt_id,
+      round_id: request.round_id,
+      round_index: request.round_index,
+      launch_attempt: request.launch_attempt,
+      result_round_revision: 1,
+      transcript: request.transcript,
+      failure_code: 'E_AGENT_ROUND_AMBIGUOUS',
+    }));
+    const controller = agentController(store, runtime, committedPersistence(store));
+    const conversationId = store.getState().selectedConversationId!;
+    await controller.send({ conversationId, text: 'offline round', attachments: [] });
+    const attempt = store.getState().conversations[conversationId]!.attempts[0]!;
+    expect(attempt.agent!.phase).toBe('failed');
+    expect(attempt.agent!.round_lineage!.status).toBe('failed_retryable');
+    expect(attempt.status).toBe('failed');
+    // The terminal checkpoint carries its cleanup, and finalize/discard drain
+    // it: a refused checkpoint reached neither.
+    expect(runtime.finalizeAgentAttempt).toHaveBeenCalledTimes(1);
+    expect(runtime.discardAgentAttempt).toHaveBeenCalledTimes(1);
+  });
+
+  /**
+   * A turn interrupted while it was waiting for a person has to be able to
+   * ask again.
+   *
+   * Four separate rules had to agree before it could. The recovery must not
+   * target a round whose outcome the journal already carries -- the round
+   * selector binds the request to the row's *before* transcript, so a
+   * committed round always answers conflict. The reducer must allow a
+   * recovery that finds the attempt standing still. The projection and the
+   * journal must describe an open intent in the same words. And the approval
+   * tokens, which live only in the run, have to be taken back from the
+   * projection, or the call has nothing to show.
+   */
+  test('a turn recovered while it waits for a person asks again', async () => {
+    const store = agentStore();
+    const runtime = makeRuntime([]);
+    const conversationId = store.getState().selectedConversationId!;
+    // Hold the turn where a person would hold it: at the question.
+    const asked = deferred<{ status: 'approved'; scope: 'once' }>();
+    const first = agentController(
+      store, runtime, committedPersistence(store), [...IDS],
+      jest.fn(async () => await asked.promise),
+    );
+    const sending = first.send({ conversationId, text: 'approve me', attachments: [] });
+    for (let index = 0; index < 200 && first.getState().phase !== 'approval_pending'; index += 1) {
+      await Promise.resolve();
+    }
+    const attempt = store.getState().conversations[conversationId]!.attempts[0]!;
+    const journal = attempt.agent!;
+    expect(journal.phase).toBe('approval_pending');
+    expect(first.getState().phase).toBe('approval_pending');
+
+    // What native reports about the same attempt. The calls are the ones the
+    // batch preparation already returned, so their execution status is
+    // native's own word for an open intent rather than this test's.
+    const prepared = await (runtime.prepareAgentToolBatch as jest.Mock).mock.results[0]!.value;
+    const projection: AgentAttemptProjectionV2 = {
+      schema_version: 2,
+      task_id: attempt.turnId,
+      conversation_id: conversationId,
+      attempt_id: attempt.attemptId,
+      phase: journal.phase,
+      controller_generation: journal.controller_generation + 1,
+      journal_revision: attempt.journalRevision ?? 0,
+      authority_revision: 1,
+      root: journal.root,
+      policy: {
+        schema_version: 1,
+        policy_version: 'agent-v1',
+        max_single_write_bytes: journal.policy.max_single_write_bytes,
+        max_batch_write_bytes: journal.policy.max_batch_write_bytes,
+        max_attempt_write_bytes: journal.policy.max_attempt_write_bytes,
+      },
+      registry: {
+        schema_version: 2,
+        registry_version: journal.tool_registry_version,
+        toolset_sha256: journal.toolset_sha256,
+        tools: [],
+      },
+      transcript: journal.transcript,
+      round_index: journal.round_index,
+      round_id: journal.round_lineage?.round_id ?? null,
+      round_revision: journal.round_lineage?.native_row_revision ?? null,
+      round_status: journal.round_lineage?.status ?? null,
+      batch_kind: prepared.receipt.batch_kind,
+      batch_revision: prepared.receipt.batch_revision,
+      manifest_sha256: prepared.receipt.manifest_sha256,
+      call_index: journal.call_index,
+      batch: prepared.receipt.calls,
+      frozen_grant_ids: [...journal.frozen_grant_ids],
+      reserved_write_bytes: journal.reserved_write_bytes,
+      cancel_source_event_id: null,
+      cleanup_id: null,
+    };
+    (runtime.queryAgentAttempt as jest.Mock).mockResolvedValue({
+      schema_version: 2,
+      status: 'active',
+      attempt: projection,
+    } as QueryAgentAttemptResultV2);
+    (runtime.recoverAgentAttempt as jest.Mock).mockImplementation(async (request: any): Promise<RecoverAgentAttemptResultV2> => ({
+      schema_version: 2,
+      status: 'resumed',
+      operation_id: request.operation_id,
+      next_action: 'none',
+      attempt: projection,
+      completed_round: null,
+    }));
+
+    // A reload: the journal survives, the run's approval tokens do not.
+    // A recovery mints its own operation ids; sharing the first run's queue
+    // would replay an event the session already holds.
+    const askedAgain = jest.fn(async () => ({ status: 'approved' as const, scope: 'once' as const }));
+    const reloaded = agentController(store, runtime, committedPersistence(store), [
+      '51515151-5151-4515-8515-515151515151',
+      '52525252-5252-4525-8525-525252525252',
+      '53535353-5353-4535-8535-535353535353',
+      '54545454-5454-4545-8545-545454545454',
+      '55555555-5555-4555-8555-555555555555',
+      '56565656-5656-4565-8565-565656565656',
+      '57575757-5757-4575-8575-575757575757',
+    ], askedAgain);
+    await reloaded.resume(conversationId, attempt.attemptId);
+
+    const target = (runtime.recoverAgentAttempt as jest.Mock).mock.calls[0][0].target;
+    expect(target.kind).toBe('attempt');
+    // The recovery was accepted rather than refused as a conflict -- which is
+    // the whole of what those four rules had to agree on -- and the turn put
+    // its question back to the person.
+    const after = store.getState().conversations[conversationId]!.attempts[0]!.agent!;
+    expect(after.controller_generation).toBeGreaterThan(journal.controller_generation);
+    expect(askedAgain).toHaveBeenCalled();
+    asked.resolve({ status: 'approved', scope: 'once' });
+    await sending;
+  });
+
   test('restarts through query/recover without replaying an in-flight round', async () => {
+
     const store = agentStore();
     const runtime = makeRuntime([]);
     (runtime.completeAgentRoundV2 as jest.Mock).mockImplementationOnce(async (request: CompleteAgentRoundRequestV2) => ({

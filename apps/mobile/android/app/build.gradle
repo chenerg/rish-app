@@ -249,8 +249,8 @@ android {
         buildConfigField "boolean", "RISH_OFFICIAL_CLI_ENABLED", officialCliEnabled.toString()
         buildConfigField "boolean", "RISH_GUEST_RUNTIME_BUNDLED", rishGuestEnabled.toString()
         manifestPlaceholders.officialCliProbeEnabled = officialCliProbeEnabled
-        versionCode 1
-        versionName "1.0"
+        versionCode 44
+        versionName "1.43-workspaces"
         // Phase-1 Android bring-up: instrumented smoke test runner.
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
     }

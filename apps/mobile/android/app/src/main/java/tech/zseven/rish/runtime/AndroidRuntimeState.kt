@@ -14,29 +14,80 @@ internal class AndroidRuntimeState private constructor(val app: Application) {
     /// The agent WAL lives beside the session database, outside backup, in the
     /// same bytes iOS writes. One root, because Android resolves none.
     val agentWal = AndroidAgentWal(java.io.File(app.noBackupFilesDir, "agent"))
-    /// App-private workspace roots. Android resolves only these: no
-    /// security-scoped folders, no legacy projects, no rebinding yet.
-    val workspaces = AndroidWorkspaceRegistry(java.io.File(app.filesDir, "workspaces"))
+    /// SAF mechanics: the persisted grants and provider queries a granted
+    /// workspace root lives on.
+    val safAccess = AndroidSafAccess(app.contentResolver)
+    /// Workspace roots: app-private directories and granted SAF trees. No
+    /// legacy projects, no rebinding yet.
+    val workspaces = AndroidWorkspaceRegistry(java.io.File(app.filesDir, "workspaces"), safAccess)
     val roots = AndroidAgentRootResolver(workspaces)
     val preparedAttempts = AndroidPreparedAttemptStore(sessions, agentWal, roots)
     /// Which native tasks this process still owns; a persisted owner from a
     /// previous launch is not alive, so its rows can be recovered.
     val liveTasks = AndroidLiveTasks()
-    val executionLedger = AndroidAgentExecutionLedger(agentWal, liveTasks)
-    val workspaceTools = AndroidWorkspaceToolExecutor(workspaces, roots)
+    val agentOperations = AndroidAgentOperations(agentWal)
+    val executionLedger = AndroidAgentExecutionLedger(agentWal, liveTasks, agentOperations)
+    val workspaceTools = AndroidWorkspaceToolExecutor(workspaces, roots, safAccess)
+    /// The registry-v3 runtime tools, as far as this platform serves them:
+    /// the listing runs, the four mutations refuse per call at preparation.
+    val runtimeTools = AndroidRuntimeToolExecutor(roots)
+    val agentPolicy = AndroidAgentPolicyService(roots, AndroidAgentToolRegistry)
     val agentRounds = AndroidAgentRoundJournal(agentWal, liveTasks)
+    val agentTranscripts = AndroidAgentTranscriptStore(agentWal)
     val toolBatch = AndroidAgentToolBatchService(
         agentWal, sessions, preparedAttempts, executionLedger, roots, workspaceTools,
+        agentOperations, agentTranscripts, runtimeTools,
     )
     val toolExecution = AndroidAgentToolExecutionService(
         agentWal, sessions, preparedAttempts, executionLedger, roots, workspaceTools, liveTasks,
+        agentTranscripts, agentOperations, runtimeTools,
+    )
+    val lifecycle = AndroidAgentLifecycleService(agentWal, sessions, agentOperations, roots)
+    val approvals = AndroidAgentApprovalService(
+        agentWal, sessions, executionLedger, agentOperations, roots,
     )
     val transport = AndroidModelTransport(credentials, configurations)
     val providerRound = AndroidAgentProviderRoundService(
         sessions, preparedAttempts, agentRounds, roots, AndroidAgentToolRegistry, transport, agentWal,
+        agentOperations, liveTasks, agentTranscripts,
     )
+    val queries = AndroidAgentQueryService(
+        agentWal, sessions, preparedAttempts, executionLedger, agentTranscripts,
+    )
+    val recovery = AndroidAgentRecoveryService(
+        agentWal, sessions, preparedAttempts, queries, providerRound, toolExecution, roots,
+        agentOperations,
+    )
+    val cancellation = AndroidAgentCancelService(
+        agentWal, sessions, preparedAttempts, executionLedger, providerRound, roots,
+        agentOperations,
+    )
+    /// Files a person attached to a message: copied in once, because a
+    /// document URI is a borrowed permission and a draft has to outlive it.
+    val attachments = AndroidAttachmentStore(app.filesDir)
+    /// What the Files drawer lists and opens, over the same roots and the
+    /// same core rules the agent's tools use.
+    val workspaceFiles = AndroidWorkspaceFiles(workspaces, roots)
+    /// Documents coming into a workspace or going back out, staged first so
+    /// a half-finished import can be finished instead of repeated.
+    val documentTransfers = AndroidDocumentTransfers(
+        app.filesDir, workspaceFiles, workspaces, roots,
+    )
+    /// The guest's package mirrors, staged into an app-private overlay that
+    /// no booted guest reads yet -- the same overlay, and the same standing
+    /// caveat, as iOS.
+    val mirrors = AndroidMirrorStore(app.filesDir)
     val subscriptionAuth = AndroidSubscriptionAuthManager(app)
     val io = Executors.newFixedThreadPool(2)
+    /**
+     * Where a round's preview goes, when anyone is listening.
+     *
+     * The bridge sets this when JavaScript subscribes and clears it when the
+     * last listener goes away; the round service only asks for a stream when
+     * it is set. Preview material is display-only and is never persisted, so
+     * nothing downstream depends on whether it was delivered.
+     */
+    @Volatile var roundPreview: ((JSONObject) -> Unit)? = null
     @Volatile var selectedSlot = "DEEPSEEK_API_KEY"
     @Volatile var restored = false
     companion object {
@@ -44,6 +95,9 @@ internal class AndroidRuntimeState private constructor(val app: Application) {
         fun get(context: Context): AndroidRuntimeState = instance ?: synchronized(this) {
             instance ?: AndroidRuntimeState(context.applicationContext as Application).also { instance = it }
         }
+
+        /** The runtime if one exists; a service deep in a turn never makes one. */
+        fun current(): AndroidRuntimeState? = instance
     }
     fun loadSnapshot(): JSONObject = sessions.load().also {
         if(it.getString("status") == "present" && it.getString("writer_launch_instance_id") != AndroidSessionStore.launchId) restored = true
@@ -62,7 +116,12 @@ internal class AndroidRuntimeState private constructor(val app: Application) {
             .put("mac_dsh_port_3180_reachable", JSONObject.NULL)
             .put("checks", JSONObject().put("credential_in_keychain", false).put("credential_in_secure_store", hasCredential)
                 .put("model_response_received", model != null && AndroidProviderConfiguration.harness(model) == harness)
-                .put("session_restored_after_restart", restored).put("rish_applet_executed", false))
+                .put("session_restored_after_restart", restored).put("rish_applet_executed", false)
+                // The guest applet and the workspace tools are two different
+                // things, and this build has one of them. Reporting only the
+                // applet made the status say "local tools unavailable" while
+                // list_dir, read_file and write_file were running.
+                .put("workspace_tools_available", RishAgentCoreNative.available))
         transport.lastProof?.let { proof.put("model_response", JSONObject(it.toString())) }
         return JSONObject().put("proof", proof).put("rish", JSONObject().put("available", false))
     }

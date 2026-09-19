@@ -63,7 +63,7 @@ import { RuntimeProgramSheet } from '../components/runtime-program-sheet';
 import { ConversationOptionsPicker } from '../components/ConversationOptionsPicker';
 import { HarnessPicker } from '../components/HarnessPicker';
 import type { StructuredBlock } from '../components/StructuredContent';
-import { projectAgentActivity, projectRoundPreviews } from '../components/agentActivityProjection';
+import { previewArgumentsByCall, projectAgentActivity, projectRoundPreviews } from '../components/agentActivityProjection';
 import { nativeAgentRoundPreviewSource } from '../agent/AgentRoundPreviewSource';
 import type { AgentRoundPreviewState } from '../agent/AgentRoundPreview';
 import { readAgentAttemptPresentation, type AgentAttemptPresentation } from '../agent/AgentRoundPresentation';
@@ -594,7 +594,7 @@ export function displayMessages(
 ): DisplayMessage[] {
   const rendered = (conversation?.messages ?? []).map(message => {
     const attempt = conversation?.attempts.find(item => item.assistantMessageId === message.id);
-    const projectedTools = attempt === undefined ? [] : projectAgentActivity(sessionEvents, attempt.attemptId, presentations[attempt.attemptId], true);
+    const projectedTools = attempt === undefined ? [] : projectAgentActivity(sessionEvents, attempt.attemptId, presentations[attempt.attemptId], true, previewArgumentsByCall(roundPreviews, attempt.attemptId));
     const blocks: StructuredBlock[] | undefined =
       message.role === 'assistant' && message.metadata?.reasoning !== undefined
         ? [
@@ -646,7 +646,7 @@ export function displayMessages(
   const orderedAttempts = conversation.attempts.slice().sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt));
   for (const attempt of orderedAttempts) {
     if (attempt.assistantMessageId !== null) continue;
-    const blocks = projectAgentActivity(sessionEvents, attempt.attemptId, presentations[attempt.attemptId]);
+    const blocks = projectAgentActivity(sessionEvents, attempt.attemptId, presentations[attempt.attemptId], false, previewArgumentsByCall(roundPreviews, attempt.attemptId));
     // Streamed material of rounds still in flight, then a bare "thinking"
     // placeholder while the round is being prepared or sent.
     blocks.push(...projectRoundPreviews(roundPreviews, attempt.attemptId, sessionEvents, presentations[attempt.attemptId], labels));
@@ -1873,6 +1873,23 @@ export function HomeScreen({
     completionState.phase === 'commit_pending';
   const completionActionVisible =
     completionRetryVisible || completionAgentRetryBlocked;
+  /**
+   * A round that reached the provider and was never answered is `ambiguous`,
+   * and recovery answers that with manual reconciliation every time -- for
+   * good reason, since the model may already have done the work. Without a
+   * second action the turn has nowhere to go, so offer the one decision only
+   * a person can make: give up on this attempt and ask again.
+   */
+  const completionAgentUnresolved =
+    completionAgentRetryBlocked &&
+    completionState.conversationId !== null &&
+    completionState.attemptId !== null &&
+    selectConversationById(chatState, completionState.conversationId)?.attempts.some(
+      attempt =>
+        attempt.attemptId === completionState.attemptId &&
+        (attempt.agent?.phase === 'ambiguous' ||
+          attempt.agent?.phase === 'unknown'),
+    ) === true;
   const completionNoticeVisible = completionActionVisible;
   const durabilityFailure =
     completionState.phase === 'persistence_pending' ||
@@ -2687,7 +2704,12 @@ export function HomeScreen({
     : runtimeLocal
     ? t('runtime.status.verified')
     : proof?.platform?.startsWith('android')
-    ? t(proof.checks.model_response_received ? 'runtime.status.chatReadyToolsPending' : 'runtime.status.chatConfiguredToolsPending')
+    // The guest applet and the workspace tools are separate things. Saying
+    // "local tools unavailable" while list_dir and write_file were running
+    // was one sentence covering both, and it was wrong about one of them.
+    ? t(proof.checks.workspace_tools_available === true
+        ? (proof.checks.model_response_received ? 'runtime.status.chatReadyToolsLocal' : 'runtime.status.chatConfiguredToolsLocal')
+        : (proof.checks.model_response_received ? 'runtime.status.chatReadyToolsPending' : 'runtime.status.chatConfiguredToolsPending'))
     : t('runtime.status.incomplete');
   const runtimeStatus: RuntimeVerificationStatus = runtimeChecking
     ? 'checking'
@@ -3319,6 +3341,69 @@ export function HomeScreen({
         );
       }
       if (result !== null) applyCompletionOutcome(result, outcomeEpoch);
+    } finally {
+      retryActionInFlight.current = false;
+    }
+  }, [
+    applyCompletionOutcome,
+    completionController,
+    refreshProof,
+    restoreCurrentSessionAuthority,
+    store,
+    t,
+  ]);
+
+  /**
+   * Give up on an attempt whose round nobody can resolve, and ask again.
+   *
+   * The same guards as `retry`: nothing else may be in flight, and the state
+   * must still be the one the button was drawn from.
+   */
+  const abandonAndRetry = useCallback(async (expected: CompletionControllerState) => {
+    if (
+      retryActionInFlight.current ||
+      directProjectMutationOutboxRef.current !== null ||
+      lifecycleIntentRef.current !== null ||
+      store.getState().projectContextDestructiveTransition !== null ||
+      activeAttachmentOperation.current !== null ||
+      activeAttachmentPreviewId.current !== null
+    )
+      return;
+    const current = completionController.getState();
+    if (
+      current.epoch !== expected.epoch ||
+      current.phase !== expected.phase ||
+      current.conversationId !== expected.conversationId ||
+      current.attemptId !== expected.attemptId ||
+      current.roundId !== expected.roundId ||
+      current.conversationId === null ||
+      current.attemptId === null
+    ) {
+      return;
+    }
+    if (!(await restoreCurrentSessionAuthority())) {
+      setStorageWarning(t('home.persistenceUnavailable'));
+      return;
+    }
+    const restored = completionController.getState();
+    if (
+      restored.epoch !== current.epoch ||
+      restored.phase !== current.phase ||
+      restored.conversationId !== current.conversationId ||
+      restored.attemptId !== current.attemptId ||
+      restored.roundId !== current.roundId
+    ) {
+      return;
+    }
+    retryActionInFlight.current = true;
+    const outcomeEpoch = ++completionUiEpoch.current;
+    try {
+      const result = await completionController.abandonAndRetry(
+        current.conversationId,
+        current.attemptId,
+        { onCommitted: () => refreshProof().catch(() => undefined) },
+      );
+      applyCompletionOutcome(result, outcomeEpoch);
     } finally {
       retryActionInFlight.current = false;
     }
@@ -6072,7 +6157,10 @@ export function HomeScreen({
 
   return (
     <KeyboardAvoidingView
-      behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+      // Android is edge-to-edge on this React Native version, so the window
+      // no longer resizes under the IME and the composer must be padded up
+      // the same way iOS pads it. `undefined` here left the composer covered.
+      behavior="padding"
       style={styles.root}
     >
       <View
@@ -6215,6 +6303,27 @@ export function HomeScreen({
                   ]}
                 >
                   <Text style={styles.retryText}>{completionRecoveryLabel(completionState.phase, t)}</Text>
+                </Pressable>
+              )}
+              {completionAgentUnresolved && visibleRequestFailure !== null && (
+                <Pressable
+                  accessibilityLabel={t('recovery.abandonAndRetry')}
+                  accessibilityRole="button"
+                  accessibilityState={{
+                    disabled:
+                      attachmentBusy || previewingAttachmentId !== null,
+                  }}
+                  disabled={attachmentBusy || previewingAttachmentId !== null}
+                  hitSlop={hitSlop}
+                  onPress={() =>
+                    abandonAndRetry(completionState).catch(() => undefined)
+                  }
+                  style={({ pressed }) => [
+                    styles.retry,
+                    pressed && styles.pressed,
+                  ]}
+                >
+                  <Text style={styles.retryText}>{t('recovery.abandonAndRetry')}</Text>
                 </Pressable>
               )}
               {workspaceBindingRecoveryVisible && (

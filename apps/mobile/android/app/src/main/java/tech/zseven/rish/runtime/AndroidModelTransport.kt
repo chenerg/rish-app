@@ -47,7 +47,10 @@ internal class AndroidModelTransport(private val credentials: AndroidCredentialS
         val toolCount = input.optJSONArray("tools")?.length() ?: 0
         if (toolCount > 64) fail("E_COMPLETION_CONTEXT_UNSUPPORTED")
         if (schema == 2) {
-            if (!input.isNull("project_context") || input.getJSONArray("round_transcript").length() != 0) fail("E_COMPLETION_CONTEXT_UNSUPPORTED")
+            if (!input.isNull("project_context")) fail("E_COMPLETION_CONTEXT_UNSUPPORTED")
+            // The round transcript is judged in execute, where the protocol is
+            // known: only chat-completions can carry one.
+            if ((input.optJSONArray("round_transcript")?.length() ?: 0) > 64) fail("E_COMPLETION_CONTEXT_UNSUPPORTED")
             if (!RuntimeJson.uuid(input.getString("turn_id")) || !RuntimeJson.uuid(input.getString("attempt_id"))) fail("E_COMPLETION_IDENTIFIER")
             if (input.opt("round_index") !is Int || input.getInt("round_index") !in 0..7) fail("E_COMPLETION_ROUND")
         }
@@ -100,6 +103,26 @@ internal class AndroidModelTransport(private val credentials: AndroidCredentialS
      */
     internal fun functionToolsForTest(declared: JSONArray): JSONArray = functionTools(declared)
 
+    /**
+     * One round-transcript entry as a provider message.
+     *
+     * The core has already shaped these -- an assistant turn with its
+     * `tool_calls`, or a `tool` result against a call id. What is dropped here
+     * is only the nulls: a provider sent `"content": null` beside tool calls,
+     * or a null `reasoning_content`, rejects the whole request.
+     */
+    private fun roundMessage(entry: JSONObject): JSONObject {
+        val message = JSONObject()
+        for (key in entry.keys()) {
+            val value = entry.opt(key)
+            if (value == null || value == JSONObject.NULL) continue
+            if (value is JSONArray && value.length() == 0) continue
+            message.put(key, value)
+        }
+        if (!message.has("content")) message.put("content", "")
+        return message
+    }
+
     private fun functionTools(declared: JSONArray): JSONArray {
         val tools = JSONArray()
         for (index in 0 until declared.length()) {
@@ -117,7 +140,123 @@ internal class AndroidModelTransport(private val credentials: AndroidCredentialS
         return tools
     }
 
-    fun execute(request: Prepared): JSONObject {
+    /**
+     * Reads a server-sent event stream into the reply the rest of this file
+     * already knows how to read.
+     *
+     * Each `data:` line is a chat-completions chunk: the first carries the
+     * response id and the model, the rest carry deltas. Text, reasoning and
+     * tool-call fragments are accumulated by the same rules the provider would
+     * have applied itself, and handed to the sink as they arrive. `[DONE]`
+     * ends it; a stream that ends without a finish reason is a truncated
+     * response, not a silent success.
+     */
+    internal fun assembleStream(stream: java.io.InputStream, sink: (JSONObject) -> Unit): JSONObject {
+        var id: String? = null
+        var model: String? = null
+        var finish: String? = null
+        val text = StringBuilder()
+        val reasoning = StringBuilder()
+        // Tool calls arrive in fragments keyed by index: the name once, the
+        // arguments a few characters at a time.
+        val calls = sortedMapOf<Int, JSONObject>()
+        var read = 0L
+        stream.bufferedReader(Charsets.UTF_8).use { reader ->
+            while (true) {
+                val line = reader.readLine() ?: break
+                read += line.length + 1
+                if (read > 4 * 1024 * 1024) fail("E_COMPLETION_RESPONSE_SIZE")
+                if (!line.startsWith("data:")) continue
+                val payload = line.removePrefix("data:").trim()
+                if (payload.isEmpty()) continue
+                if (payload == "[DONE]") break
+                val chunk = try {
+                    JSONObject(payload)
+                } catch (_: Exception) {
+                    fail("E_COMPLETION_RESPONSE_JSON")
+                }
+                if (id == null) id = chunk.optString("id").takeIf { it.isNotEmpty() }
+                if (model == null) model = chunk.optString("model").takeIf { it.isNotEmpty() }
+                val choice = chunk.optJSONArray("choices")?.optJSONObject(0) ?: continue
+                choice.optString("finish_reason").takeIf { it.isNotEmpty() && it != "null" }
+                    ?.let { finish = it }
+                val delta = choice.optJSONObject("delta") ?: JSONObject()
+                val event = JSONObject()
+                stringOrEmpty(delta, "content").takeIf { it.isNotEmpty() }?.let {
+                    text.append(it); event.put("text", it)
+                }
+                stringOrEmpty(delta, "reasoning_content").takeIf { it.isNotEmpty() }?.let {
+                    reasoning.append(it); event.put("reasoning", it)
+                }
+                delta.optJSONArray("tool_calls")?.let { fragments ->
+                    val previewed = JSONArray()
+                    for (index in 0 until fragments.length()) {
+                        val fragment = fragments.optJSONObject(index) ?: continue
+                        val slot = fragment.optInt("index", index)
+                        val call = calls.getOrPut(slot) {
+                            JSONObject().put("id", "").put("name", "").put("arguments", "")
+                        }
+                        val preview = JSONObject().put("index", slot)
+                        fragment.optString("id").takeIf { it.isNotEmpty() }?.let {
+                            call.put("id", it); preview.put("id", it)
+                        }
+                        val function = fragment.optJSONObject("function")
+                        function?.optString("name")?.takeIf { it.isNotEmpty() }?.let {
+                            call.put("name", it); preview.put("name", it)
+                        }
+                        function?.optString("arguments")?.takeIf { it.isNotEmpty() }?.let {
+                            call.put("arguments", call.optString("arguments") + it)
+                            preview.put("arguments", it)
+                        }
+                        previewed.put(preview)
+                    }
+                    if (previewed.length() > 0) event.put("tool_calls", previewed)
+                }
+                finish?.let { event.put("finish_reason", it) }
+                // An empty chunk -- a keep-alive, or usage-only -- is nothing
+                // to show.
+                if (event.length() > 0) sink(event)
+            }
+        }
+        if (id == null || model == null || finish == null) fail("E_COMPLETION_RESPONSE_JSON")
+        val message = JSONObject().put("role", "assistant")
+            .put("content", text.toString()).put("reasoning_content", reasoning.toString())
+        if (calls.isNotEmpty()) {
+            val assembled = JSONArray()
+            for ((_, call) in calls) {
+                assembled.put(
+                    JSONObject().put("id", call.optString("id")).put("type", "function")
+                        .put(
+                            "function",
+                            JSONObject().put("name", call.optString("name"))
+                                .put("arguments", call.optString("arguments")),
+                        ),
+                )
+            }
+            message.put("tool_calls", assembled)
+        }
+        return JSONObject().put("id", id).put("model", model)
+            .put(
+                "choices",
+                JSONArray().put(
+                    JSONObject().put("index", 0).put("message", message)
+                        .put("finish_reason", finish),
+                ),
+            )
+    }
+
+    /**
+     * Runs one prepared request.
+     *
+     * `sink` asks for the reply as it arrives: on chat-completions the request
+     * is sent with `stream: true` and each chunk is handed over as it is
+     * parsed, for display only. What the round *decides* never comes from the
+     * chunks -- they are reassembled into exactly the reply shape the
+     * non-streaming path produces, and everything below this point is the same
+     * code reading the same object. A preview that disagreed with the settled
+     * round would be worse than no preview.
+     */
+    fun execute(request: Prepared, sink: ((JSONObject) -> Unit)? = null): JSONObject {
         val started = android.os.SystemClock.elapsedRealtime()
         try {
             val input = request.input
@@ -133,9 +272,21 @@ internal class AndroidModelTransport(private val credentials: AndroidCredentialS
             }
             val config = request.configuration
             val protocol = config.getString("protocol")
+            // What this round already did: the assistant turn that asked for a
+            // tool, and the results that came back. Without it the model is
+            // told nothing of the call it just made and asks for it again, so
+            // a turn with a tool in it could never finish.
+            val round = input.optJSONArray("round_transcript") ?: JSONArray()
+            if (round.length() != 0) {
+                if (protocol != "chat-completions") fail("E_COMPLETION_CONTEXT_UNSUPPORTED")
+                for (index in 0 until round.length()) {
+                    messages.put(roundMessage(round.getJSONObject(index)))
+                }
+            }
             val declared = input.optJSONArray("tools") ?: JSONArray()
             val wireModel = config.getJSONObject("model_mappings").optString(request.model, request.model)
-            val body = JSONObject().put("model", wireModel).put("stream", false)
+            val streaming = sink != null && protocol == "chat-completions"
+            val body = JSONObject().put("model", wireModel).put("stream", streaming)
             when(protocol) {
                 "messages" -> {
                     body.put("messages", messages).put("max_tokens", 8192)
@@ -169,6 +320,7 @@ internal class AndroidModelTransport(private val credentials: AndroidCredentialS
                 val builder = Request.Builder().url(config.getString("endpoint_url"))
                     .header("User-Agent", "Rish/Android").header("X-Client-Request-Id", providerRequestId)
                     .post(encoded.toRequestBody("application/json".toMediaType()))
+                if (streaming) builder.header("Accept", "text/event-stream")
                 when(config.getString("auth_type")) {
                     "bearer" -> builder.header("Authorization", "Bearer $secret")
                     "x-api-key" -> builder.header("x-api-key", secret)
@@ -182,32 +334,75 @@ internal class AndroidModelTransport(private val credentials: AndroidCredentialS
                 if(http.code == 429) fail("E_COMPLETION_HTTP_429")
                 if(!http.isSuccessful) throw RuntimeFailure("E_COMPLETION_HTTP_STATUS", http.code)
                 val stream = http.body?.byteStream() ?: fail("E_COMPLETION_RESPONSE_JSON")
-                val bytes = ByteArrayOutputStream(); val buffer = ByteArray(8192)
-                stream.use { source ->
-                    while(true) { val count = source.read(buffer); if(count < 0) break
-                        if(bytes.size() + count > 4 * 1024 * 1024) fail("E_COMPLETION_RESPONSE_SIZE")
-                        bytes.write(buffer, 0, count)
+                if (streaming) {
+                    assembleStream(stream, sink!!)
+                } else {
+                    val bytes = ByteArrayOutputStream(); val buffer = ByteArray(8192)
+                    stream.use { source ->
+                        while(true) { val count = source.read(buffer); if(count < 0) break
+                            if(bytes.size() + count > 4 * 1024 * 1024) fail("E_COMPLETION_RESPONSE_SIZE")
+                            bytes.write(buffer, 0, count)
+                        }
                     }
+                    try { JSONObject(bytes.toString("UTF-8")) } catch (_: Exception) { fail("E_COMPLETION_RESPONSE_JSON") }
                 }
-                try { JSONObject(bytes.toString("UTF-8")) } catch (_: Exception) { fail("E_COMPLETION_RESPONSE_JSON") }
             }
             synchronized(lock) { own(request) }
             val reported = response.optString("model", "")
             val glmWire = wireModel.startsWith("glm", ignoreCase = true)
-            if (!(reported == wireModel || (glmWire && reported.all { it.code < 128 } && reported.equals(wireModel, ignoreCase = true)))) fail("E_COMPLETION_RESPONSE_MODEL")
+            // DeepSeek's 2026-09-10 announcement routes these two retired
+            // request ids to V4.1 Flash (deepseek-flash). Mirrors the closed
+            // compatibility map in modules/rish/ios/Sources/DshProviderTransport.mm:
+            // the same two ids, the same official endpoint, the same single
+            // accepted alias. V4 Pro is deliberately excluded -- its announced
+            // transition is later. Without this the provider's own answer is
+            // refused as E_COMPLETION_RESPONSE_MODEL, for a plain chat as much
+            // as for an agent round.
+            val documentedLegacyAlias =
+                config.getString("endpoint_url") == "https://api.deepseek.com/chat/completions" &&
+                    wireModel in setOf("deepseek-v4-flash", "deepseek-v4-flash-vision-exp") &&
+                    reported == "deepseek-flash"
+            if (!(reported == wireModel || documentedLegacyAlias ||
+                    (glmWire && reported.all { it.code < 128 } && reported.equals(wireModel, ignoreCase = true)))
+            ) {
+                fail("E_COMPLETION_RESPONSE_MODEL")
+            }
+            if (documentedLegacyAlias) {
+                // Never claim raw equality: the receipt keeps the canonical
+                // requested model its schema requires, and the wire identity
+                // is recorded beside it.
+                response.put("model", wireModel)
+                android.util.Log.i(
+                    "RishRuntime",
+                    "completion_model_alias harness=dsh requested_model=$wireModel reported_model=deepseek-flash",
+                )
+            }
             val text: String
             val reasoning: String
             val finish: String
+            val calls = JSONArray()
             when(protocol) {
                 "chat-completions" -> {
                     val choice = response.getJSONArray("choices").getJSONObject(0)
                     val message = choice.getJSONObject("message")
-                    // Tool calls are no longer refused. They are not read here
-                    // either: turning untrusted model output into calls is the
-                    // core's rule (`completion_response`), and this carries the
-                    // provider's own reply back for it to read.
                     text = stringOrEmpty(message, "content"); reasoning = stringOrEmpty(message, "reasoning_content")
                     finish = choice.getString("finish_reason")
+                    // The calls the model asked for, carried back as the
+                    // provider stated them. What they *mean* -- whether the
+                    // name is a tool, whether the arguments parse, what may
+                    // run -- stays the core's; this only stops discarding
+                    // them, which is what left a round with tools it could
+                    // send and no way to hear an answer.
+                    val raw = message.optJSONArray("tool_calls") ?: JSONArray()
+                    for (index in 0 until raw.length()) {
+                        val call = raw.optJSONObject(index) ?: continue
+                        val function = call.optJSONObject("function") ?: continue
+                        calls.put(
+                            JSONObject().put("id", call.optString("id"))
+                                .put("name", function.optString("name"))
+                                .put("arguments", function.optString("arguments")),
+                        )
+                    }
                 }
                 "messages" -> {
                     val content = response.getJSONArray("content")
@@ -243,11 +438,14 @@ internal class AndroidModelTransport(private val credentials: AndroidCredentialS
                     }
                 }
             }
-            if(text.isBlank()) fail("E_COMPLETION_EMPTY_RESPONSE")
-            if(finish !in setOf("stop", "length")) fail("E_COMPLETION_FINISH_RELATION")
+            // A turn that only asks for a tool carries no text, and that is
+            // not an empty response -- it is the answer.
+            if(text.isBlank() && calls.length() == 0) fail("E_COMPLETION_EMPTY_RESPONSE")
+            if(finish !in setOf("stop", "length", "tool_calls")) fail("E_COMPLETION_FINISH_RELATION")
+            if((finish == "tool_calls") != (calls.length() > 0)) fail("E_COMPLETION_FINISH_RELATION")
             val responseId = response.getString("id"); if(responseId.isBlank() || responseId.length > 256) fail("E_COMPLETION_PROVIDER_RESPONSE_ID")
             val result = JSONObject().put("schema_version", input.getInt("schema_version"))
-                .put("text", text).put("reasoning", reasoning).put("tool_calls", JSONArray()).put("finish_reason", finish)
+                .put("text", text).put("reasoning", reasoning).put("tool_calls", calls).put("finish_reason", finish)
                 .put("model", request.model).put("thinking_mode", input.getString("thinking_mode"))
                 .put("latency_ms", android.os.SystemClock.elapsedRealtime() - started)
             if(input.getInt("schema_version") == 1) result.put("request_id", request.id)

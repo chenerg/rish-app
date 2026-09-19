@@ -3963,12 +3963,22 @@ function projectionCallMatchesJournal(
           ? 'denied'
           : call.approval_decision === 'cancelled'
             ? 'cancelled'
-            : 'not_started'
+            // A call that already has a ledger row is an open intent, which
+            // is what native calls it -- the `prepared_batch` stage below
+            // expects exactly that for the same shape. Demanding
+            // `not_started` here meant no attempt waiting on an approval
+            // could ever be recovered: its projection and its journal
+            // described the same call in two different words.
+            : call.native_row_revision === null
+              ? 'not_started'
+              : 'intent'
       : call.receipt.outcome === 'ok'
         ? 'completed'
         : call.receipt.outcome;
   if (projection.execution_status !== expectedExecutionStatus) return false;
-  if (projection.execution_revision !== (call.receipt === null ? null : call.native_row_revision)) return false;
+  // The revision of the ledger row this call owns, which an open intent has
+  // as surely as a settled result does.
+  if (projection.execution_revision !== call.native_row_revision) return false;
   return projection.native_row_revision === call.native_row_revision &&
     (call.receipt === null
       ? projection.receipt === null
@@ -4541,12 +4551,24 @@ function highLevelEvidenceSupportsTransition(
     evidence.request.target.kind === 'attempt' &&
     recovery.completed_round === null
   ) {
-    return current.phase === 'round_in_flight' &&
-      current.round_lineage?.native_row_revision === null &&
-      next.phase === 'ready_for_round' &&
-      next.round_lineage === null &&
-      next.batch.length === 0 &&
-      next.call_index === null;
+    // A round that never reached native at all is reset to the start.
+    if (
+      current.phase === 'round_in_flight' &&
+      current.round_lineage?.native_row_revision === null
+    ) {
+      return next.phase === 'ready_for_round' &&
+        next.round_lineage === null &&
+        next.batch.length === 0 &&
+        next.call_index === null;
+    }
+    // Otherwise the attempt is simply standing still -- waiting on an
+    // approval, or between rounds -- and there is nothing to reconcile.
+    // Native said where it stands, the projection check above already bound
+    // `next` to that answer, so the only transition this can be is the one
+    // that leaves it there. Without this the reducer refused every recovery
+    // of a turn that was waiting for a person, and the question never came
+    // back on screen.
+    return next.phase === current.phase;
   }
   switch (recovery.next_action) {
     case 'persist_round':
@@ -5633,6 +5655,7 @@ function destructiveTargetConversationId(action: ChatAction): string | null {
     case 'attempt/agent-advance-call':
     case 'attempt/agent-final-checkpoint':
     case 'agent/cleanup-enqueue':
+    case 'agent/abandon-unresolved':
       return action.payload.conversationId;
     case 'conversation/agent-grants':
       return action.payload.conversationId;
@@ -7086,6 +7109,59 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
           ...outbox,
           { ...payload.cleanup },
         ],
+      };
+    }
+
+    case 'agent/abandon-unresolved': {
+      const payload = action.payload;
+      const conversation = state.conversations[payload.conversationId];
+      const index =
+        conversation === undefined
+          ? -1
+          : attemptIndex(conversation, payload.attemptId);
+      const attempt = conversation?.attempts[index];
+      const journal = attempt?.agent;
+      const outbox = state.agentTranscriptCleanupOutbox ?? [];
+      if (
+        conversation === undefined ||
+        attempt === undefined ||
+        payload.expectedAttempt !== attempt ||
+        journal === undefined ||
+        journal === null ||
+        !isAgentAttemptJournalV3(journal) ||
+        // Only the two answers the device cannot resolve by itself. A
+        // resumable attempt is resumed, and a terminal one is already over.
+        (journal.phase !== 'ambiguous' && journal.phase !== 'unknown') ||
+        attempt.failureCode === 'E_ATTEMPT_INTERRUPTED' ||
+        attempt.assistantMessageId !== null ||
+        !isCanonicalTimestamp(payload.at) ||
+        !cleanupEntryIsValid(payload.cleanup) ||
+        payload.cleanup.reason !== 'failed' ||
+        payload.cleanup.conversation_id !== payload.conversationId ||
+        payload.cleanup.task_id !== attempt.turnId ||
+        payload.cleanup.attempt_id !== payload.attemptId ||
+        payload.cleanup.transcript_ref !== journal.transcript.transcript_ref ||
+        payload.cleanup.transcript_sha256 !==
+          journal.transcript.transcript_sha256 ||
+        outbox.length >= MAX_AGENT_CLEANUP_OUTBOX_ENTRIES ||
+        outbox.some(entry => entry.cleanup_id === payload.cleanup.cleanup_id)
+      ) return state;
+      // Recorded exactly as hydration records a dead writer's attempt: the
+      // journal stays as the round and transcript evidence, and the failure
+      // code is the one the retry reducer accepts a journal with.
+      const abandoned: TurnAttemptV1 = {
+        ...attempt,
+        status: 'failed',
+        activeRound: null,
+        failureCode: 'E_ATTEMPT_INTERRUPTED',
+        updatedAt: payload.at,
+      };
+      return {
+        ...withConversation(
+          state,
+          replaceAttempt(conversation, index, abandoned),
+        ),
+        agentTranscriptCleanupOutbox: [...outbox, { ...payload.cleanup }],
       };
     }
 

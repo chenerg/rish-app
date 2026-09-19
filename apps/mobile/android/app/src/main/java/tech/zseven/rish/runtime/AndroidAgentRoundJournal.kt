@@ -160,15 +160,43 @@ internal class AndroidAgentRoundJournal(
         run("mark_dispatched", JSONObject().put("cas", cas), cas.opt("locator"), null, null,
             false, false)
 
-    fun complete(cas: JSONObject, patch: JSONObject): JSONObject? =
-        run("complete", JSONObject().put("cas", cas).put("patch", patch),
-            cas.opt("locator"), null, patch.optJSONObject("completion_receipt"), true, false)
+    /**
+     * Settles a dispatched round with what the model answered.
+     *
+     * The core reads these flat -- `locator`, `cas`, `messages`, `receipt`,
+     * `terminal_kind`, `calls`, `root` -- and nesting them under a `patch`
+     * only ever produced InvalidArgument.
+     */
+    fun complete(
+        locator: JSONObject,
+        cas: JSONObject,
+        messages: JSONArray,
+        receipt: JSONObject,
+        terminalKind: String,
+        calls: JSONArray,
+        root: JSONObject,
+    ): JSONObject? =
+        run(
+            "complete",
+            JSONObject().put("locator", locator).put("cas", cas)
+                .put("messages", messages).put("receipt", receipt)
+                .put("terminal_kind", terminalKind).put("calls", calls)
+                .put("root", root),
+            locator, null, receipt, true, false,
+        )
 
     fun cancel(cas: JSONObject): JSONObject? =
         run("cancel", JSONObject().put("cas", cas), cas.opt("locator"), null, null, false, false)
 
+    /**
+     * The core reads this argument as `cas`, the same name every other
+     * journal operation uses. Sending it as `expected_cas` left the rule
+     * reading nothing at all, so every reconcile answered InvalidArgument and
+     * every caller quietly fell back to the row it already had -- which is
+     * how a round nobody was running stayed `in_flight` for good.
+     */
     fun reconcile(locator: JSONObject, expectedCas: JSONObject): JSONObject? =
-        run("reconcile", JSONObject().put("locator", locator).put("expected_cas", expectedCas),
+        run("reconcile", JSONObject().put("locator", locator).put("cas", expectedCas),
             locator, null, null, false, false)
 
     fun query(locator: JSONObject): JSONObject? =

@@ -4,7 +4,9 @@ import com.facebook.react.ReactPackage
 import com.facebook.react.bridge.NativeModule
 import com.facebook.react.bridge.ReactApplicationContext
 import com.facebook.react.uimanager.ViewManager
+import tech.zseven.rish.modules.AgentPolicyModule
 import tech.zseven.rish.modules.AgentRuntimeModule
+import tech.zseven.rish.modules.DebugLogModule
 import tech.zseven.rish.modules.LocalAttachmentsModule
 import tech.zseven.rish.modules.LocalDocumentsModule
 import tech.zseven.rish.modules.LocalGuestModule
@@ -34,7 +36,9 @@ class RishNativePackage : ReactPackage {
     override fun createNativeModules(reactContext: ReactApplicationContext): List<NativeModule> =
         listOf(
             tech.zseven.rish.tasks.TaskExperienceModule(reactContext),
+            AgentPolicyModule(reactContext),
             AgentRuntimeModule(reactContext),
+            DebugLogModule(reactContext),
             LocalAttachmentsModule(reactContext),
             LocalDocumentsModule(reactContext),
             LocalGuestModule(reactContext),
